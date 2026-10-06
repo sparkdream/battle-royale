@@ -1,0 +1,228 @@
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #1d2b1f;
+  color: #f2f2f2;
+  font: 14px/1.4 system-ui, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+#game { position: fixed; inset: 0; }
+/* The game draws its own crosshair. */
+body.playing:not(.touch) #game canvas { cursor: none; }
+
+button {
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: #6fcf6f;
+  color: #0f1710;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.6; cursor: wait; }
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 16px;
+  background: rgba(10, 16, 11, 0.85);
+}
+.overlay h1 { margin: 0 0 8px; font-size: 40px; letter-spacing: 0.04em; text-align: center; }
+.overlay input, .overlay button, .overlay .field { width: 240px; max-width: 100%; }
+.overlay input, .overlay select {
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid #4a5d4c;
+  background: #0f1710;
+  color: inherit;
+  font: inherit;
+}
+.field { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.field select { flex: 1; }
+.hint { opacity: 0.6; margin: 4px 0 0; text-align: center; max-width: 520px; }
+.error { color: #ff8a80; min-height: 1.4em; margin: 0; }
+body.touch .desktop-only { display: none; }
+
+#hud { position: fixed; inset: 0; pointer-events: none; }
+#hud > div, #hud > canvas { position: absolute; }
+
+#stats, #feed div, #status:not(:empty), #prompt, #action, .slot {
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 6px;
+}
+
+#stats { top: 12px; left: 12px; padding: 6px 10px; }
+
+#status {
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+#status.warn { background: rgba(140, 30, 160, 0.75); }
+
+#feed {
+  top: 12px;
+  right: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+#feed div { padding: 4px 10px; }
+#feed .weapon { opacity: 0.65; }
+
+#banner {
+  top: 22%;
+  left: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  text-align: center;
+  text-shadow: 0 2px 6px #000;
+}
+#banner[hidden] { display: none; }
+#banner-title { font-size: 34px; font-weight: 700; }
+#banner-sub { font-size: 16px; opacity: 0.9; }
+#banner-stats:empty, #banner-board:empty { display: none; }
+#banner-stats {
+  display: grid;
+  grid-template-columns: repeat(4, auto);
+  gap: 4px 20px;
+  padding: 10px 16px;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 8px;
+  text-shadow: none;
+}
+#banner-stats .value { font-size: 20px; font-weight: 700; }
+#banner-stats .label { font-size: 12px; opacity: 0.7; }
+#banner-board {
+  margin: 0;
+  padding: 8px 16px 8px 36px;
+  min-width: 220px;
+  text-align: left;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 8px;
+  text-shadow: none;
+}
+#banner-board li span { float: right; opacity: 0.8; margin-left: 16px; }
+#banner-hint { font-size: 13px; opacity: 0.75; }
+#play-again { pointer-events: auto; margin-top: 4px; text-shadow: none; }
+
+#bottom {
+  left: 50%;
+  bottom: 16px;
+  width: 420px;
+  max-width: calc(100% - 32px);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+#prompt { padding: 4px 10px; text-align: center; }
+#action { display: flex; align-items: center; gap: 8px; padding: 4px 10px; }
+#action[hidden] { display: none; }
+#action-bar { width: 90px; height: 6px; background: rgba(255, 255, 255, 0.2); border-radius: 3px; overflow: hidden; }
+#action-fill { height: 100%; width: 0; background: #f2f2f2; }
+
+#inventory { display: flex; gap: 6px; width: 100%; }
+.slot {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 2px solid transparent;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.slot.active { border-color: rgba(255, 255, 255, 0.85); }
+.slot.empty { opacity: 0.45; }
+.slot.medkits { flex: 0 0 auto; }
+.slot .key { font-size: 11px; opacity: 0.6; }
+.slot .name { font-weight: 600; }
+.slot .ammo { margin-left: auto; opacity: 0.85; flex-shrink: 0; }
+.slot .name { overflow: hidden; text-overflow: ellipsis; }
+
+.bar {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.bar > div { height: 100%; width: 0; transition: width 80ms linear; }
+#hp { height: 14px; }
+#hp-fill { background: #6fcf6f; }
+#armor { height: 6px; }
+#armor-fill { background: #5aa9e6; }
+
+#minimap {
+  right: 12px;
+  bottom: 12px;
+  border: 2px solid rgba(0, 0, 0, 0.6);
+  border-radius: 6px;
+}
+
+/* Touch controls: two virtual sticks and a column of buttons. */
+#touch { position: fixed; inset: 0; pointer-events: none; }
+#touch[hidden] { display: none; }
+.stick-zone { position: absolute; top: 25%; bottom: 0; width: 50%; pointer-events: auto; }
+#stick-move { left: 0; }
+#stick-aim { right: 0; }
+.stick {
+  position: absolute;
+  width: 120px;
+  height: 120px;
+  margin: -60px 0 0 -60px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  display: none;
+}
+.stick.on { display: block; }
+.knob {
+  position: absolute;
+  left: 35px;
+  top: 35px;
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.45);
+}
+#touch-buttons {
+  position: absolute;
+  right: 12px;
+  top: 30%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+}
+#touch-buttons button { padding: 10px 14px; background: rgba(0, 0, 0, 0.55); color: #fff; border: 1px solid rgba(255, 255, 255, 0.3); }
+#touch-buttons button[hidden] { display: none; }
+body.touch #minimap { top: 48px; bottom: auto; left: 12px; right: auto; }
+
+@media (max-width: 640px) {
+  #minimap { width: 112px !important; height: 112px !important; }
+  #banner-title { font-size: 26px; }
+  #banner-stats { grid-template-columns: repeat(2, auto); }
+}

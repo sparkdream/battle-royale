@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Battle Royale</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="game"></div>
+
+    <form id="menu" class="overlay">
+      <h1>Battle Royale</h1>
+      <input id="name" maxlength="16" placeholder="Your name" autocomplete="off" />
+      <label class="field">Bots
+        <select id="difficulty">
+          <option value="easy">Easy</option>
+          <option value="normal" selected>Normal</option>
+          <option value="hard">Hard</option>
+        </select>
+      </label>
+      <button type="submit">Play</button>
+      <p class="hint desktop-only">WASD move · mouse aim · click shoot · 1/2/Q switch weapon · R reload · H heal · E pick up · Space jump</p>
+      <p id="career" class="hint"></p>
+      <p id="menu-error" class="error"></p>
+    </form>
+
+    <div id="hud" hidden>
+      <div id="stats"><span id="alive"></span> · <span id="kills"></span> kills · <span id="ping"></span></div>
+      <div id="status"></div>
+      <div id="feed"></div>
+
+      <div id="banner" hidden>
+        <div id="banner-title"></div>
+        <div id="banner-sub"></div>
+        <div id="banner-stats"></div>
+        <ol id="banner-board"></ol>
+        <button id="play-again" type="button" hidden>Play again</button>
+        <div id="banner-hint"></div>
+      </div>
+
+      <div id="bottom">
+        <div id="prompt" hidden></div>
+        <div id="action" hidden><span id="action-label"></span><div id="action-bar"><div id="action-fill"></div></div></div>
+        <div id="inventory">
+          <div class="slot" id="slot0"><span class="key">1</span><span class="name"></span><span class="ammo"></span></div>
+          <div class="slot" id="slot1"><span class="key">2</span><span class="name"></span><span class="ammo"></span></div>
+          <div class="slot medkits"><span class="key">H</span><span class="name">Medkit</span><span class="ammo" id="medkits"></span></div>
+        </div>
+        <div id="armor" class="bar"><div id="armor-fill"></div></div>
+        <div id="hp" class="bar"><div id="hp-fill"></div></div>
+      </div>
+
+      <canvas id="minimap"></canvas>
+    </div>
+
+    <div id="touch" hidden>
+      <div class="stick-zone" id="stick-move"><div class="stick"><div class="knob"></div></div></div>
+      <div class="stick-zone" id="stick-aim"><div class="stick"><div class="knob"></div></div></div>
+      <div id="touch-buttons">
+        <button type="button" data-action="jump">Jump</button>
+        <button type="button" data-action="interact">Pick up</button>
+        <button type="button" data-action="swap">Swap</button>
+        <button type="button" data-action="reload">Reload</button>
+        <button type="button" data-action="heal">Heal</button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

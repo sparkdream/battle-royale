@@ -1,0 +1,17 @@
+{
+  "name": "@br/client",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@br/shared": "*"
+  },
+  "devDependencies": {
+    "vite": "^8.3.3",
+    "@colyseus/sdk": "^0.18.5",
+    "phaser": "^4.2.1"
+  }
+}

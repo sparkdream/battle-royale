@@ -1,0 +1,793 @@
+import { type Client, Room } from "@colyseus/core";
+import { StateView } from "@colyseus/schema";
+import {
+  ARMOR_ABSORB, BULLET_RADIUS, Bullet, CRATE_SIZE, DIFFICULTIES, DROP_SECONDS, type Difficulty,
+  ENDED_SECONDS, GameState, type HitMessage, INTERP_DELAY_MS, type InputMessage, type JoinOptions,
+  KEY_HEAL, KEY_INTERACT, KEY_JUMP, KEY_MASK, KEY_RELOAD, type KillMessage, LAG_COMP_MAX_MS,
+  LOBBY_SECONDS, LOOT_AMMO, LOOT_ARMOR, LOOT_MEDKIT, MAP_SIZE, MAX_ARMOR, MAX_HEALTH, MAX_MEDKITS,
+  MAX_PLAYERS, MEDKIT_HEAL, MEDKIT_TICKS, MIN_PLAYERS_TO_START, MSG_HIT, MSG_INPUT, MSG_KILL,
+  MSG_LATENCY, MSG_MATCH_END, MSG_SPECTATE, MSG_SPECTATE_NEXT, MSG_STATS, MUZZLE_OFFSET,
+  type MatchEndMessage, PHASE_DROP, PHASE_ENDED, PHASE_LOBBY, PHASE_PLAYING, PICKUP_RADIUS,
+  PLAYER_COLORS, PLAYER_RADIUS, Player, RECONNECT_SECONDS, type SpectateMessage, type StatsMessage,
+  TICK_DT, TICK_MS, TICK_RATE, WEAPONS, WEAPON_NONE, WEAPON_PISTOL, type Weapon, activeWeapon,
+  ammoPickupAmount, ammoTarget, canSee, circleBlocked, giveWeapon, isWeaponLoot, magIn, maxReserve,
+  raycastSolid, reserveIn, resetInventory, segmentCircleHit, setMag, setReserve, setSlotContents,
+  stepPlayer, weaponIn,
+} from "@br/shared";
+import { Bot, type BotWorld, SKILL, botName, randomPersonality } from "./Bot";
+import { type GeneratedMap, dropLoot, generateMap, randomLootType, resetCrates, spawnLoot } from "./map";
+import { ZoneController } from "./ZoneController";
+
+// Inputs applied per player per tick. Lets a client that stalled catch up a
+// little without letting it move faster than everyone else.
+const MAX_INPUTS_PER_TICK = 2;
+const MAX_QUEUED_INPUTS = 8;
+
+const env = (name: string, fallback: number) => Number(process.env[name] ?? fallback);
+const MAP_COUNTS = {
+  rocks: env("OBSTACLE_COUNT", 110),
+  buildings: env("BUILDING_COUNT", 10),
+  ponds: env("POND_COUNT", 6),
+  bushes: env("BUSH_COUNT", 45),
+  crates: env("CRATE_COUNT", 35),
+};
+const OPEN_LOOT_COUNT = env("LOOT_COUNT", 90);
+// Bots top the room up to this many combatants; each human who joins replaces one.
+const BOT_FILL = env("BOT_FILL", 10);
+const LOBBY_TICKS = env("LOBBY_SECONDS", LOBBY_SECONDS) * TICK_RATE;
+const DROP_TICKS = Math.max(1, env("DROP_SECONDS", DROP_SECONDS) * TICK_RATE);
+// > 1 speeds up the zone, for testing.
+const MATCH_SPEED = env("MATCH_SPEED", 1);
+
+// Position history for lag compensation, one slot per tick.
+const HISTORY_TICKS = Math.ceil(LAG_COMP_MAX_MS / TICK_MS) + 2;
+
+interface PlayerMeta {
+  inputs: InputMessage[];
+  lastQueuedSeq: number;
+  /** Keys held in the last applied input, to detect presses. */
+  prevKeys: number;
+  /** Slot asked for in the last applied input; only a change counts as a switch request. */
+  prevSlot: number;
+  nextFireTick: number;
+  reloadDoneTick: number;
+  healDoneTick: number;
+  zoneDamage: number; // fractional damage carried between ticks
+  latencyMs: number;
+  histX: Float32Array;
+  histY: Float32Array;
+  /** First tick with valid history (reset on teleport). */
+  histFrom: number;
+  damageDealt: number;
+  spawnTick: number;
+  /** Who a dead player is spectating. */
+  watchId: string;
+  /** Players currently in this client's StateView. */
+  visible: Set<string>;
+}
+
+interface BulletSim {
+  owner: string;
+  weapon: Weapon;
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  traveled: number;
+  /** How many ticks back to test targets, to match what the shooter saw. */
+  rewind: number;
+}
+
+export class GameRoom extends Room<{ state: GameState }> {
+  maxClients = MAX_PLAYERS;
+
+  private difficulty: Difficulty = "normal";
+  private tick = 0;
+  private phaseTicks = 0;
+  private map!: GeneratedMap;
+  private zone!: ZoneController;
+  private meta = new Map<string, PlayerMeta>();
+  private bullets = new Map<string, BulletSim>();
+  private nextId = 0;
+  private scratch = { x: 0, y: 0 };
+  private bots = new Map<string, Bot>();
+  private botsCreated = 0;
+  private botWorld!: BotWorld;
+
+  onCreate(options?: JoinOptions) {
+    const requested = options?.difficulty;
+    this.difficulty = requested && DIFFICULTIES.includes(requested) ? requested : "normal";
+    this.setState(new GameState());
+    this.state.difficulty = this.difficulty;
+    this.map = generateMap(this.state, MAP_COUNTS, () => this.newId());
+    this.zone = new ZoneController(this.state.zone, MATCH_SPEED);
+    this.botWorld = {
+      tick: 0, phase: PHASE_LOBBY, players: this.state.players, loot: this.state.loot,
+      geo: this.map.geo, zone: this.state.zone, plane: this.state.plane,
+    };
+
+    this.onMessage(MSG_INPUT, (client, msg: InputMessage) => this.queueInput(client, msg));
+    this.onMessage(MSG_LATENCY, (client, ms: unknown) => {
+      const meta = this.meta.get(client.sessionId);
+      if (meta && typeof ms === "number" && Number.isFinite(ms)) meta.latencyMs = Math.max(0, Math.min(ms, 1000));
+    });
+    this.onMessage(MSG_SPECTATE_NEXT, (client) => this.spectateNext(client.sessionId));
+
+    this.setPatchRate(TICK_MS);
+    this.setFixedTimestep(() => this.update(), TICK_RATE);
+    this.enterLobby();
+  }
+
+  onJoin(client: Client, options?: JoinOptions) {
+    const player = new Player();
+    player.name = sanitizeName(options?.name) || `Player ${this.clients.length}`;
+    this.addPlayer(client.sessionId, player);
+    // Arrived mid-match (the room locks, but joins can race it): spectate until the next lobby.
+    if (this.state.phase !== PHASE_LOBBY) player.alive = false;
+    client.view = new StateView();
+    this.balanceBots();
+  }
+
+  onDrop(client: Client) {
+    // Keep their player in the world for a while in case they come back.
+    // Rejects if they don't make it back (or the room closes); onLeave handles that.
+    this.allowReconnection(client, RECONNECT_SECONDS).catch(() => {});
+  }
+
+  onReconnect(client: Client) {
+    client.view = new StateView();
+    this.meta.get(client.sessionId)?.visible.clear();
+  }
+
+  onLeave(client: Client) {
+    this.removePlayer(client.sessionId);
+    this.balanceBots();
+  }
+
+  // ---- Match flow -------------------------------------------------------
+
+  private enterLobby() {
+    this.state.phase = PHASE_LOBBY;
+    this.phaseTicks = LOBBY_TICKS;
+    this.zone.reset();
+    this.clearBullets();
+    this.state.loot.clear();
+    resetCrates(this.state, this.map);
+    this.state.players.forEach((p, id) => this.resetPlayer(id, p));
+    this.balanceBots();
+    void this.unlock();
+  }
+
+  private startDrop() {
+    if (this.state.players.size < MIN_PLAYERS_TO_START) {
+      this.phaseTicks = LOBBY_TICKS;
+      return;
+    }
+    this.state.phase = PHASE_DROP;
+    this.phaseTicks = DROP_TICKS;
+    // Late joiners get matched into a fresh room instead.
+    void this.lock();
+    this.clearBullets();
+    spawnLoot(this.state, this.map.geo, OPEN_LOOT_COUNT, () => this.newId());
+
+    // A straight flight path across the map, passing near the middle.
+    const a = Math.random() * Math.PI * 2;
+    const dx = Math.cos(a);
+    const dy = Math.sin(a);
+    const offset = (Math.random() * 2 - 1) * MAP_SIZE * 0.15;
+    const cx = MAP_SIZE / 2 - dy * offset;
+    const cy = MAP_SIZE / 2 + dx * offset;
+    const half = MAP_SIZE * 0.6;
+    const plane = this.state.plane;
+    plane.x0 = cx - dx * half;
+    plane.y0 = cy - dy * half;
+    plane.x1 = cx + dx * half;
+    plane.y1 = cy + dy * half;
+    plane.t = 0;
+
+    this.state.players.forEach((p, id) => {
+      this.resetPlayer(id, p);
+      p.inPlane = true;
+      p.x = plane.x0;
+      p.y = plane.y0;
+    });
+  }
+
+  private startPlaying() {
+    this.state.players.forEach((p, id) => {
+      if (p.inPlane) this.land(id, p);
+    });
+    this.state.phase = PHASE_PLAYING;
+    this.zone.start();
+  }
+
+  private endMatch(winnerId: string | null) {
+    this.state.phase = PHASE_ENDED;
+    this.phaseTicks = ENDED_SECONDS * TICK_RATE;
+    const winner = winnerId ? this.state.players.get(winnerId) : undefined;
+    if (winnerId && winner) this.sendStats(winnerId, winner, 1, "");
+
+    const leaderboard: MatchEndMessage["leaderboard"] = [];
+    this.state.players.forEach((p) => leaderboard.push({ name: p.name, kills: p.kills }));
+    leaderboard.sort((a, b) => b.kills - a.kills);
+    this.broadcast(MSG_MATCH_END, {
+      winner: winner?.name ?? "", winnerId: winnerId ?? "", leaderboard: leaderboard.slice(0, 5),
+    } satisfies MatchEndMessage);
+  }
+
+  private balanceBots() {
+    // Bots can't drop into a match in progress; fix the count at the next lobby.
+    if (this.state.phase !== PHASE_LOBBY) return;
+    const humans = this.clients.length;
+    const wanted = humans === 0 ? 0 : Math.max(0, Math.min(BOT_FILL, MAX_PLAYERS) - humans);
+    while (this.bots.size < wanted) {
+      const id = `bot-${this.botsCreated}`;
+      const player = new Player();
+      player.name = botName(this.botsCreated++);
+      player.bot = true;
+      this.bots.set(id, new Bot(id, SKILL[this.difficulty], randomPersonality()));
+      this.addPlayer(id, player);
+    }
+    for (const id of this.bots.keys()) {
+      if (this.bots.size <= wanted) break;
+      this.removePlayer(id);
+    }
+  }
+
+  // ---- Players ----------------------------------------------------------
+
+  private addPlayer(id: string, player: Player) {
+    this.meta.set(id, {
+      inputs: [], lastQueuedSeq: 0, prevKeys: 0, prevSlot: 0, nextFireTick: 0, reloadDoneTick: 0, healDoneTick: 0,
+      zoneDamage: 0, latencyMs: 0, histX: new Float32Array(HISTORY_TICKS), histY: new Float32Array(HISTORY_TICKS),
+      histFrom: this.tick, damageDealt: 0, spawnTick: this.tick, watchId: "", visible: new Set(),
+    });
+    player.color = this.pickColor();
+    this.state.players.set(id, player);
+    this.resetPlayer(id, player);
+  }
+
+  private removePlayer(id: string) {
+    this.state.players.delete(id);
+    this.meta.delete(id);
+    this.bots.delete(id);
+  }
+
+  /** A random color among the least-used ones, so colors are unique until the palette runs out. */
+  private pickColor(): number {
+    const uses = PLAYER_COLORS.map(() => 0);
+    this.state.players.forEach((p) => uses[p.color]++);
+    const fewest = Math.min(...uses);
+    const candidates = uses.flatMap((n, i) => (n === fewest ? [i] : []));
+    return candidates[Math.floor(Math.random() * candidates.length)];
+  }
+
+  private resetPlayer(id: string, p: Player) {
+    p.hp = MAX_HEALTH;
+    p.armor = 0;
+    p.kills = 0;
+    p.alive = true;
+    p.inPlane = false;
+    resetInventory(p);
+    this.placeAtSpawn(p);
+    const meta = this.meta.get(id)!;
+    meta.inputs.length = 0;
+    meta.prevSlot = 0;
+    meta.zoneDamage = 0;
+    meta.nextFireTick = 0;
+    meta.damageDealt = 0;
+    meta.spawnTick = this.tick;
+    meta.watchId = "";
+    meta.histFrom = this.tick + 1;
+  }
+
+  private placeAtSpawn(player: Player) {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const x = 60 + Math.random() * (MAP_SIZE - 120);
+      const y = 60 + Math.random() * (MAP_SIZE - 120);
+      if (!circleBlocked(this.map.geo, x, y, PLAYER_RADIUS + 4)) {
+        player.x = x;
+        player.y = y;
+        return;
+      }
+    }
+    player.x = MAP_SIZE / 2;
+    player.y = MAP_SIZE / 2;
+  }
+
+  /** Jump out of the plane: land at the nearest free spot under it. */
+  private land(id: string, p: Player) {
+    p.inPlane = false;
+    const x0 = Math.min(MAP_SIZE - 120, Math.max(120, p.x));
+    const y0 = Math.min(MAP_SIZE - 120, Math.max(120, p.y));
+    let x = x0;
+    let y = y0;
+    search: for (let r = 0; r <= 600; r += 30) {
+      for (let i = 0; i < 12; i++) {
+        const a = (i / 12) * Math.PI * 2;
+        x = x0 + Math.cos(a) * r;
+        y = y0 + Math.sin(a) * r;
+        if (!circleBlocked(this.map.geo, x, y, PLAYER_RADIUS + 4)) break search;
+      }
+    }
+    p.x = x;
+    p.y = y;
+    this.meta.get(id)!.histFrom = this.tick + 1;
+  }
+
+  private queueInput(client: Client, msg: InputMessage) {
+    const meta = this.meta.get(client.sessionId);
+    if (!meta || !msg) return;
+    const { seq, keys, angle, fire, slot } = msg;
+    if (!Number.isInteger(seq) || seq <= meta.lastQueuedSeq) return;
+    if (!Number.isInteger(keys) || (keys & ~KEY_MASK) !== 0) return;
+    if (typeof angle !== "number" || !Number.isFinite(angle)) return;
+    if (slot !== 0 && slot !== 1) return;
+    if (meta.inputs.length >= MAX_QUEUED_INPUTS) return;
+    meta.lastQueuedSeq = seq;
+    meta.inputs.push({ seq, keys, angle, fire: fire === true, slot });
+  }
+
+  // ---- Simulation -------------------------------------------------------
+
+  private get combat() {
+    return this.state.phase === PHASE_DROP || this.state.phase === PHASE_PLAYING;
+  }
+
+  private update() {
+    this.tick++;
+    this.botWorld.tick = this.tick;
+    this.botWorld.phase = this.state.phase;
+
+    switch (this.state.phase) {
+      case PHASE_LOBBY:
+        if (this.countdown()) this.startDrop();
+        break;
+      case PHASE_DROP: {
+        const plane = this.state.plane;
+        plane.t = 1 - Math.max(0, this.phaseTicks - 1) / DROP_TICKS;
+        const px = plane.x0 + (plane.x1 - plane.x0) * plane.t;
+        const py = plane.y0 + (plane.y1 - plane.y0) * plane.t;
+        this.state.players.forEach((p) => {
+          if (!p.inPlane) return;
+          p.x = px;
+          p.y = py;
+        });
+        if (this.countdown()) this.startPlaying();
+        break;
+      }
+      case PHASE_PLAYING:
+        this.zone.update();
+        this.setTimer(this.zone.secondsLeft);
+        break;
+      case PHASE_ENDED:
+        if (this.countdown()) {
+          this.enterLobby();
+          return;
+        }
+        break;
+    }
+
+    const dps = this.state.phase === PHASE_PLAYING ? this.zone.dps : 0;
+    const slot = this.tick % HISTORY_TICKS;
+    this.state.players.forEach((player, id) => {
+      if (!player.alive) return;
+      const meta = this.meta.get(id)!;
+      const bot = this.bots.get(id);
+      if (bot) {
+        this.applyInput(id, player, meta, bot.think(player, this.botWorld));
+      } else {
+        for (let n = 0; n < MAX_INPUTS_PER_TICK && meta.inputs.length > 0; n++) {
+          this.applyInput(id, player, meta, meta.inputs.shift()!);
+        }
+      }
+      if (player.inPlane) return;
+
+      meta.histX[slot] = player.x;
+      meta.histY[slot] = player.y;
+
+      if (!this.combat) return;
+      this.finishTimers(player, meta);
+      this.autoPickup(player);
+      if (dps > 0 && this.zone.isOutside(player.x, player.y)) {
+        meta.zoneDamage += dps * TICK_DT;
+        if (meta.zoneDamage >= 1) {
+          const amount = Math.floor(meta.zoneDamage);
+          meta.zoneDamage -= amount;
+          this.damage(id, amount, null, "zone");
+        }
+      }
+    });
+
+    this.updateBullets();
+
+    let alive = 0;
+    let last: string | null = null;
+    this.state.players.forEach((p, id) => {
+      if (p.alive) {
+        alive++;
+        last = id;
+      }
+    });
+    this.setIfChanged("aliveCount", alive);
+    this.setIfChanged("playerCount", this.state.players.size);
+    if (this.combat && alive <= 1) this.endMatch(last);
+
+    this.updateViews();
+  }
+
+  /** Tick the lobby/drop/results countdown; true when it runs out. */
+  private countdown(): boolean {
+    this.phaseTicks--;
+    this.setTimer(Math.ceil(this.phaseTicks / TICK_RATE));
+    return this.phaseTicks <= 0;
+  }
+
+  private applyInput(id: string, player: Player, meta: PlayerMeta, input: InputMessage) {
+    const pressed = input.keys & ~meta.prevKeys;
+    meta.prevKeys = input.keys;
+    player.lastSeq = input.seq;
+    player.angle = input.angle;
+
+    if (player.inPlane) {
+      if (pressed & KEY_JUMP) this.land(id, player);
+      return;
+    }
+
+    const pos = this.scratch;
+    pos.x = player.x;
+    pos.y = player.y;
+    stepPlayer(pos, input.keys, this.map.geo);
+    player.x = pos.x;
+    player.y = pos.y;
+
+    if (!this.combat) return;
+
+    // Humans: a slot switch is a change in the requested slot, so inputs sent
+    // before the client saw a server-side switch (e.g. a pickup) can't undo it.
+    // Bots have no latency, so theirs is simply the slot they want.
+    const requested = this.bots.has(id) || input.slot !== meta.prevSlot;
+    meta.prevSlot = input.slot;
+    if (requested && input.slot !== player.slot && weaponIn(player, input.slot) !== WEAPON_NONE) {
+      player.slot = input.slot;
+      player.reloading = false;
+    }
+    if (pressed & KEY_INTERACT) this.pickupWeapon(player);
+    if (pressed & KEY_RELOAD) this.startReload(player, meta);
+    if (pressed & KEY_HEAL) this.startHeal(player, meta);
+    if (input.fire) this.tryFire(id, player, meta);
+  }
+
+  // ---- Weapons ----------------------------------------------------------
+
+  private tryFire(id: string, player: Player, meta: PlayerMeta) {
+    if (this.tick < meta.nextFireTick || player.reloading) return;
+    const type = activeWeapon(player);
+    if (type === WEAPON_NONE) return;
+    const mag = magIn(player, player.slot);
+    if (mag === 0) {
+      this.startReload(player, meta);
+      return;
+    }
+
+    const weapon = WEAPONS[type];
+    meta.nextFireTick = this.tick + weapon.cooldownTicks;
+    player.healing = false; // shooting interrupts healing
+    const rewind = this.bots.has(id)
+      ? 0
+      : Math.round(Math.min(LAG_COMP_MAX_MS, meta.latencyMs + INTERP_DELAY_MS) / TICK_MS);
+
+    for (let i = 0; i < weapon.pellets; i++) {
+      const angle = player.angle + (Math.random() * 2 - 1) * weapon.spread;
+      const dx = Math.cos(angle);
+      const dy = Math.sin(angle);
+      const x = player.x + dx * MUZZLE_OFFSET;
+      const y = player.y + dy * MUZZLE_OFFSET;
+      const bid = this.newId();
+      const bullet = new Bullet();
+      bullet.owner = id;
+      bullet.x = x;
+      bullet.y = y;
+      bullet.angle = angle;
+      bullet.weapon = type;
+      this.state.bullets.set(bid, bullet);
+      this.bullets.set(bid, { owner: id, weapon, x, y, dx, dy, traveled: 0, rewind });
+    }
+
+    setMag(player, player.slot, mag - 1);
+    if (mag - 1 > 0) return;
+    if (this.canReload(player, player.slot)) {
+      this.startReload(player, meta);
+    } else {
+      // Out of ammo for good: throw it away and switch to whatever else we have.
+      setSlotContents(player, player.slot, WEAPON_NONE, 0, 0);
+      if (weaponIn(player, 1 - player.slot) !== WEAPON_NONE) player.slot = 1 - player.slot;
+    }
+  }
+
+  private canReload(p: Player, slot: number): boolean {
+    const type = weaponIn(p, slot);
+    if (type === WEAPON_NONE) return false;
+    const w = WEAPONS[type];
+    return magIn(p, slot) < w.mag && (w.reserve === 0 || reserveIn(p, slot) > 0);
+  }
+
+  private startReload(p: Player, meta: PlayerMeta) {
+    if (p.reloading || !this.canReload(p, p.slot)) return;
+    p.reloading = true;
+    meta.reloadDoneTick = this.tick + WEAPONS[activeWeapon(p)].reloadTicks;
+  }
+
+  private startHeal(p: Player, meta: PlayerMeta) {
+    if (p.healing || p.medkits === 0 || p.hp >= MAX_HEALTH) return;
+    p.healing = true;
+    meta.healDoneTick = this.tick + MEDKIT_TICKS;
+  }
+
+  private finishTimers(p: Player, meta: PlayerMeta) {
+    if (p.reloading && this.tick >= meta.reloadDoneTick) {
+      p.reloading = false;
+      const w = WEAPONS[activeWeapon(p)];
+      const mag = magIn(p, p.slot);
+      const take = w.reserve === 0 ? w.mag - mag : Math.min(w.mag - mag, reserveIn(p, p.slot));
+      setMag(p, p.slot, mag + take);
+      if (w.reserve > 0) setReserve(p, p.slot, reserveIn(p, p.slot) - take);
+    }
+    if (p.healing && this.tick >= meta.healDoneTick) {
+      p.healing = false;
+      p.hp = Math.min(MAX_HEALTH, p.hp + MEDKIT_HEAL);
+      p.medkits--;
+    }
+  }
+
+  private updateBullets() {
+    const hitR = PLAYER_RADIUS + BULLET_RADIUS;
+
+    for (const [id, b] of this.bullets) {
+      const step = b.weapon.speed * TICK_DT;
+      const x1 = b.x + b.dx * step;
+      const y1 = b.y + b.dy * step;
+
+      // Closest thing hit this step: something solid, or a player (rewound).
+      const solid = raycastSolid(this.map.geo, b.x, b.y, x1, y1, BULLET_RADIUS);
+      let hitT = solid ? solid.t : 2;
+      let hitPlayer: string | null = null;
+      const slot = (((this.tick - b.rewind) % HISTORY_TICKS) + HISTORY_TICKS) % HISTORY_TICKS;
+      this.state.players.forEach((p, sid) => {
+        if (!p.alive || p.inPlane || sid === b.owner) return;
+        const meta = this.meta.get(sid)!;
+        const rewound = this.tick - b.rewind >= meta.histFrom;
+        const px = rewound ? meta.histX[slot] : p.x;
+        const py = rewound ? meta.histY[slot] : p.y;
+        const t = segmentCircleHit(b.x, b.y, x1, y1, px, py, hitR);
+        if (t >= 0 && t < hitT) {
+          hitT = t;
+          hitPlayer = sid;
+        }
+      });
+
+      b.traveled += step;
+      if (hitT <= 1 || b.traveled >= b.weapon.range) {
+        if (hitPlayer) this.damage(hitPlayer, b.weapon.damage, b.owner, b.weapon.name);
+        else if (solid?.crateId && hitT === solid.t) this.damageCrate(solid.crateId, b.weapon.damage);
+        this.bullets.delete(id);
+        this.state.bullets.delete(id);
+      } else {
+        b.x = x1;
+        b.y = y1;
+      }
+    }
+  }
+
+  private damageCrate(id: string, amount: number) {
+    const crate = this.state.crates.get(id);
+    if (!crate || !this.combat) return;
+    if (crate.hp > amount) {
+      crate.hp -= amount;
+      return;
+    }
+    this.state.crates.delete(id);
+    const i = this.map.crates.findIndex((c) => c.id === id);
+    if (i >= 0) this.map.crates.splice(i, 1);
+    if (Math.random() < 0.6) {
+      dropLoot(this.state, this.newId(), randomLootType(), crate.x + CRATE_SIZE / 2, crate.y + CRATE_SIZE / 2);
+    }
+  }
+
+  private damage(victimId: string, amount: number, attackerId: string | null, cause: string) {
+    if (!this.combat) return;
+    const victim = this.state.players.get(victimId);
+    if (!victim || !victim.alive || victim.inPlane) return;
+
+    if (attackerId && victim.armor > 0) {
+      const absorbed = Math.min(victim.armor, Math.round(amount * ARMOR_ABSORB));
+      victim.armor -= absorbed;
+      amount -= absorbed;
+    }
+    const dealt = Math.min(victim.hp, Math.round(amount));
+    victim.hp -= dealt;
+
+    if (attackerId) {
+      const attackerMeta = this.meta.get(attackerId);
+      if (attackerMeta) attackerMeta.damageDealt += dealt;
+      this.clients.getById(attackerId)?.send(MSG_HIT, {
+        x: Math.round(victim.x), y: Math.round(victim.y), damage: dealt, kill: victim.hp === 0,
+      } satisfies HitMessage);
+    }
+    if (victim.hp > 0) return;
+
+    victim.alive = false;
+    victim.healing = false;
+    victim.reloading = false;
+    let place = 1;
+    this.state.players.forEach((p) => {
+      if (p.alive) place++;
+    });
+    const attacker = attackerId ? this.state.players.get(attackerId) : undefined;
+    if (attacker) attacker.kills++;
+
+    // Spill their gear.
+    let spill = 0;
+    const scatter = () => {
+      const a = spill++ * 2.1;
+      return [victim.x + Math.cos(a) * 18, victim.y + Math.sin(a) * 18] as const;
+    };
+    for (const slot of [0, 1]) {
+      const w = weaponIn(victim, slot);
+      if (w !== WEAPON_NONE && w !== WEAPON_PISTOL) {
+        dropLoot(this.state, this.newId(), w, ...scatter(), reserveIn(victim, slot) + magIn(victim, slot));
+      }
+    }
+    for (let i = 0; i < victim.medkits; i++) dropLoot(this.state, this.newId(), LOOT_MEDKIT, ...scatter());
+
+    this.broadcast(MSG_KILL, { killer: attacker?.name ?? "", victim: victim.name, weapon: cause } satisfies KillMessage);
+    this.sendStats(victimId, victim, place, attacker?.name ?? "");
+    const meta = this.meta.get(victimId)!;
+    meta.watchId = attacker?.alive && attackerId ? attackerId : "";
+    if (!meta.watchId) this.spectateNext(victimId);
+    else this.sendSpectate(victimId);
+  }
+
+  private sendStats(id: string, p: Player, place: number, killer: string) {
+    const meta = this.meta.get(id);
+    if (!meta) return;
+    this.clients.getById(id)?.send(MSG_STATS, {
+      place,
+      kills: p.kills,
+      damage: meta.damageDealt,
+      survivedSeconds: Math.round((this.tick - meta.spawnTick) / TICK_RATE),
+      killer,
+    } satisfies StatsMessage);
+  }
+
+  // ---- Loot -------------------------------------------------------------
+
+  private autoPickup(player: Player) {
+    const r2 = PICKUP_RADIUS * PICKUP_RADIUS;
+    this.state.loot.forEach((loot, id) => {
+      if ((loot.x - player.x) ** 2 + (loot.y - player.y) ** 2 > r2) return;
+      if (loot.type === LOOT_MEDKIT && player.medkits < MAX_MEDKITS) {
+        player.medkits++;
+      } else if (loot.type === LOOT_ARMOR && player.armor < MAX_ARMOR) {
+        player.armor = MAX_ARMOR;
+      } else if (loot.type === LOOT_AMMO) {
+        const slot = ammoTarget(player);
+        if (slot < 0) return;
+        const type = weaponIn(player, slot);
+        const reserve = reserveIn(player, slot);
+        if (reserve >= maxReserve(type)) return;
+        setReserve(player, slot, Math.min(maxReserve(type), reserve + ammoPickupAmount(type)));
+      } else {
+        return;
+      }
+      this.state.loot.delete(id);
+    });
+  }
+
+  private pickupWeapon(player: Player) {
+    let bestId: string | null = null;
+    let bestD = PICKUP_RADIUS * PICKUP_RADIUS;
+    this.state.loot.forEach((loot, id) => {
+      if (!isWeaponLoot(loot.type)) return;
+      const d = (loot.x - player.x) ** 2 + (loot.y - player.y) ** 2;
+      if (d <= bestD) {
+        bestD = d;
+        bestId = id;
+      }
+    });
+    if (!bestId) return;
+    const loot = this.state.loot.get(bestId)!;
+    this.state.loot.delete(bestId);
+    player.reloading = false;
+    const dropped = giveWeapon(player, loot.type, loot.amount);
+    if (dropped) dropLoot(this.state, this.newId(), dropped.weapon, player.x, player.y, dropped.reserve);
+  }
+
+  // ---- Vision and spectating --------------------------------------------
+
+  /**
+   * Each client is only sent the players it can see: itself, whoever it's
+   * spectating, and anyone canSee() allows from where it (or its spectate
+   * target) stands. This is both anti-wallhack and interest management.
+   */
+  private updateViews() {
+    const players = this.state.players;
+    for (const client of this.clients) {
+      const id = client.sessionId;
+      const meta = this.meta.get(id);
+      const self = players.get(id);
+      const view = client.view;
+      if (!meta || !self || !view) continue;
+
+      if (!self.alive && this.state.phase !== PHASE_LOBBY && !players.get(meta.watchId)?.alive) {
+        this.spectateNext(id);
+      }
+      const viewerId = self.alive ? id : meta.watchId || id;
+      const viewer = players.get(viewerId) ?? self;
+
+      const next = new Set<string>();
+      players.forEach((p, pid) => {
+        if (pid === id || pid === viewerId
+            || (!p.inPlane && !viewer.inPlane && canSee(this.map.geo, viewer.x, viewer.y, p.x, p.y))) {
+          next.add(pid);
+        }
+      });
+      for (const pid of next) {
+        if (!meta.visible.has(pid)) view.add(players.get(pid)!);
+      }
+      for (const pid of meta.visible) {
+        if (next.has(pid)) continue;
+        const p = players.get(pid);
+        if (p) view.remove(p);
+      }
+      meta.visible = next;
+    }
+  }
+
+  /** Point a dead player's camera at the next living player (in id order). */
+  private spectateNext(id: string) {
+    const meta = this.meta.get(id);
+    const self = this.state.players.get(id);
+    if (!meta || !self || self.alive) return;
+    const ids: string[] = [];
+    this.state.players.forEach((p, pid) => {
+      if (p.alive && !p.inPlane && pid !== id) ids.push(pid);
+    });
+    ids.sort();
+    const next = ids.find((pid) => pid > meta.watchId) ?? ids[0] ?? "";
+    if (next === meta.watchId) return;
+    meta.watchId = next;
+    this.sendSpectate(id);
+  }
+
+  private sendSpectate(id: string) {
+    const meta = this.meta.get(id);
+    if (!meta) return;
+    const target = this.state.players.get(meta.watchId);
+    this.clients.getById(id)?.send(MSG_SPECTATE, { id: meta.watchId, name: target?.name ?? "" } satisfies SpectateMessage);
+  }
+
+  // ---- Helpers ----------------------------------------------------------
+
+  private clearBullets() {
+    this.bullets.clear();
+    this.state.bullets.clear();
+  }
+
+  private setTimer(seconds: number) {
+    this.setIfChanged("timer", seconds);
+  }
+
+  private setIfChanged(key: "timer" | "aliveCount" | "playerCount", value: number) {
+    if (this.state[key] !== value) this.state[key] = value;
+  }
+
+  private newId() {
+    return (this.nextId++).toString(36);
+  }
+}
+
+function sanitizeName(name: unknown): string {
+  if (typeof name !== "string") return "";
+  return name.replace(/[^\p{L}\p{N} _-]/gu, "").trim().slice(0, 16);
+}
