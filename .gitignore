@@ -3,5 +3,7 @@ dist/
 *.log
 .DS_Store
 .env
+# Server-side leaderboard
+data/
 CLAUDE.md
 .claude/

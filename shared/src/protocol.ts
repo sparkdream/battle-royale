@@ -21,12 +21,14 @@ export type Difficulty = (typeof DIFFICULTIES)[number];
 export const MSG_INPUT = "i";
 export const MSG_LATENCY = "lat";
 export const MSG_SPECTATE_NEXT = "specnext";
+export const MSG_SETTINGS = "settings";
 // server -> client
 export const MSG_KILL = "kill";
 export const MSG_HIT = "hit";
 export const MSG_STATS = "stats";
 export const MSG_SPECTATE = "spec";
 export const MSG_MATCH_END = "end";
+export const MSG_NOTICE = "notice";
 
 /** Sent by the client once per fixed step. */
 export interface InputMessage {
@@ -78,7 +80,41 @@ export interface MatchEndMessage {
   leaderboard: { name: string; kills: number }[];
 }
 
+/** From the in-game menu. Omitted fields stay as they are. */
+export interface SettingsMessage {
+  name?: string;
+  /** The room's bot difficulty, for everyone; takes effect in the lobby. */
+  difficulty?: Difficulty;
+  /** Switch between playing and spectating (refused while alive in a match). */
+  spectate?: boolean;
+}
+
+/**
+ * Matchmaking error code: the server already runs as many games as it allows
+ * (MAX_ROOMS). Colyseus sends it as the HTTP status, so it must be 200–599.
+ */
+export const ERR_SERVER_FULL = 503;
+
+/** HTTP route on the game server listing the top human players. */
+export const LEADERBOARD_PATH = "/leaderboard";
+export const LEADERBOARD_SIZE = 50;
+
+/** A human player's lifetime results, by name. */
+export interface LeaderboardEntry {
+  name: string;
+  matches: number;
+  wins: number;
+  kills: number;
+  damage: number;
+  /** Best finishing place (1 = won). */
+  bestPlace: number;
+  /** ms since the epoch. */
+  lastPlayed: number;
+}
+
 export interface JoinOptions {
   name?: string;
   difficulty?: Difficulty;
+  /** Join only to watch. */
+  spectate?: boolean;
 }

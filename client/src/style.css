@@ -14,7 +14,7 @@ html, body {
 
 #game { position: fixed; inset: 0; }
 /* The game draws its own crosshair. */
-body.playing:not(.touch) #game canvas { cursor: none; }
+body.playing.aiming:not(.touch) #game canvas { cursor: none; }
 
 button {
   padding: 10px 12px;
@@ -27,6 +27,7 @@ button {
   cursor: pointer;
 }
 button:disabled { opacity: 0.6; cursor: wait; }
+button.secondary { background: transparent; color: inherit; border: 1px solid #4a5d4c; }
 
 .overlay {
   position: fixed;
@@ -39,6 +40,23 @@ button:disabled { opacity: 0.6; cursor: wait; }
   padding: 16px;
   background: rgba(10, 16, 11, 0.85);
 }
+.overlay[hidden] { display: none; }
+
+/* Opaque: it opens over the start menu. */
+#board { background: #0a100b; }
+#board .table-wrap {
+  max-width: 100%;
+  max-height: 60vh;
+  overflow: auto;
+  touch-action: pan-x pan-y; /* the page otherwise blocks touch scrolling */
+}
+#board table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+#board th, #board td { padding: 6px 10px; text-align: right; white-space: nowrap; }
+#board th { position: sticky; top: 0; background: #0f1710; font-size: 12px; opacity: 0.8; }
+#board .name { text-align: left; }
+#board tbody tr:nth-child(odd) { background: rgba(255, 255, 255, 0.04); }
+#board tr.me { color: #6fcf6f; font-weight: 600; }
+#board-status:empty, #pause-spectate-note:empty { display: none; }
 .overlay h1 { margin: 0 0 8px; font-size: 40px; letter-spacing: 0.04em; text-align: center; }
 .overlay input, .overlay button, .overlay .field { width: 240px; max-width: 100%; }
 .overlay input, .overlay select {
@@ -51,6 +69,9 @@ button:disabled { opacity: 0.6; cursor: wait; }
 }
 .field { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .field select { flex: 1; }
+.field.check { justify-content: flex-start; }
+.overlay .field.check input { width: 18px; height: 18px; margin: 0; accent-color: #6fcf6f; }
+.field.check:has(input:disabled) { opacity: 0.5; }
 .hint { opacity: 0.6; margin: 4px 0 0; text-align: center; max-width: 520px; }
 .error { color: #ff8a80; min-height: 1.4em; margin: 0; }
 body.touch .desktop-only { display: none; }
@@ -64,6 +85,19 @@ body.touch .desktop-only { display: none; }
 }
 
 #stats { top: 12px; left: 12px; padding: 6px 10px; }
+
+/* Touch has no Esc key; this opens the in-game menu instead. */
+#menu-button {
+  top: 48px;
+  left: 12px;
+  padding: 4px 12px;
+  background: rgba(0, 0, 0, 0.45);
+  color: inherit;
+  font-size: 18px;
+  pointer-events: auto;
+}
+body:not(.touch) #menu-button { display: none; }
+#hud.spectator #inventory, #hud.spectator .bar { display: none; }
 
 #status {
   top: 12px;

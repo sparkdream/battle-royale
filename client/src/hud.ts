@@ -68,6 +68,11 @@ export class Hud {
     this.hpFill.style.background = hp > 50 ? "#6fcf6f" : hp > 25 ? "#f2c94c" : "#eb5757";
   }
 
+  /** Spectators have no health or inventory to show. */
+  setSpectator(on: boolean) {
+    if (this.changed("spectator", on)) this.root.classList.toggle("spectator", on);
+  }
+
   setArmor(armor: number) {
     if (this.changed("armor", armor)) this.armorFill.style.width = `${armor}%`;
   }
@@ -116,6 +121,13 @@ export class Hud {
     this.prompt.hidden = text === "";
   }
 
+  /** A plain line in the feed, e.g. a settings change. */
+  notice(text: string) {
+    const row = document.createElement("div");
+    row.textContent = text;
+    this.pushFeed(row);
+  }
+
   kill({ killer, victim, weapon }: KillMessage) {
     const row = document.createElement("div");
     if (killer) {
@@ -127,6 +139,10 @@ export class Hud {
     } else {
       row.textContent = `${victim} was caught by the zone`;
     }
+    this.pushFeed(row);
+  }
+
+  private pushFeed(row: HTMLElement) {
     this.feed.prepend(row);
     while (this.feed.childElementCount > FEED_MAX) this.feed.lastElementChild!.remove();
     setTimeout(() => row.remove(), FEED_MS);

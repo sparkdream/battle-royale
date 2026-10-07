@@ -13,6 +13,12 @@ npm run dev
 
 Open http://localhost:5173, pick a bot difficulty, and press Play.
 
+Other machines on your LAN can join at `http://<this machine's IP>:5173` (Vite prints the "Network" URL). The client connects to port 2567 on the same host, so the firewall must allow inbound TCP 5173 and 2567 (with `npm start`, only the one `PORT`). Under WSL2 this needs `networkingMode=mirrored` in `.wslconfig` plus a Hyper-V firewall rule, from an admin PowerShell:
+
+```powershell
+New-NetFirewallHyperVRule -Name BattleRoyaleDev -DisplayName "Battle royale dev" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 5173,2567
+```
+
 | Command | What it does |
 |---|---|
 | `npm run dev` | Game server on :2567 (restarts on save) and Vite client on :5173 (hot reload) |
@@ -31,6 +37,7 @@ Open http://localhost:5173, pick a bot difficulty, and press Play.
 | Switch weapon | 1, 2, Q or mouse wheel | Swap |
 | Reload / heal / pick up | R / H / E | Buttons |
 | Jump from the plane | Space or click | Jump |
+| Menu (name, bot difficulty, spectate, leaderboard) | Esc | ☰ button |
 | Next spectate target | Click or Space | Tap |
 
 ### Server environment variables
@@ -43,6 +50,8 @@ Open http://localhost:5173, pick a bot difficulty, and press Play.
 | `MATCH_SPEED` | `1` | Speeds up the zone. `6` gives a match of about 40 seconds |
 | `OBSTACLE_COUNT` / `BUILDING_COUNT` / `POND_COUNT` / `BUSH_COUNT` / `CRATE_COUNT` | `110` / `10` / `6` / `45` / `35` | Map generation |
 | `LOOT_COUNT` | `90` | Loot outside buildings (each building also gets 2–4) |
+| `MAX_ROOMS` | `10` | Most games running at once. Past it, new games are refused ("server is full") and players join an existing one |
+| `LEADERBOARD_FILE` | `data/leaderboard.json` | Where the server keeps the leaderboard. Empty: memory only |
 
 For example, `BOT_FILL=20 LOBBY_SECONDS=5 MATCH_SPEED=4 npm run dev`.
 
@@ -50,20 +59,26 @@ For example, `BOT_FILL=20 LOBBY_SECONDS=5 MATCH_SPEED=4 npm run dev`.
 
 ```bash
 docker build -t battle-royale .
-docker run -p 2567:2567 battle-royale
+docker run -p 2567:2567 -v br-data:/app/data battle-royale
 ```
+
+The volume keeps the leaderboard when the container is replaced.
+
+All games run on one CPU core: a full game (50 players and bots) uses about 6% of a core and each client about 10 KB/s, so the default `MAX_ROOMS=10` (500 connections) leaves plenty of headroom on a small server. Raise it on a bigger machine.
 
 One container (about 375 MB) serves the game page and the game server on port 2567. Put it behind a proxy that supports WebSockets for HTTPS. GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the typecheck, tests and build, and builds the Docker image, on every push.
 
 ## The game
 
-- **Match flow:** a lobby (walk around, no shooting), then the **drop**, the match itself, and results, then back to the lobby. During the drop a plane crosses the map and you jump whenever you like (or get dropped at the end of its path). Rooms lock once the plane leaves, and there are no respawns.
+- **Match flow:** a lobby (walk around, no shooting), then the **drop**, the match itself, and results, then back to the lobby. During the drop a plane crosses the map and you jump whenever you like (or get dropped at the end of its path). There are no respawns. Players who join after the plane leaves spectate the match in progress and play from the next one; new players are matched into the room with the most humans, so friends on a LAN end up together.
 - **Zone:** appears once the drop is over, then shrinks in 5 stages. Being outside costs 2 → 15 HP per second, and armor doesn't help.
 - **Inventory:** two weapon slots, each with its own magazine and spare ammo. You start with a pistol (unlimited spare ammo). Picking up a weapon fills an empty slot, else replaces the pistol, else replaces the weapon in your hands (which drops). Reloading takes time, and a weapon with no ammo left is discarded. Medkits (up to 3) heal 50 HP over 2.5 s, and shooting cancels the heal. Armor soaks up half of weapon damage until it's used up. Ammo pickups go to a weapon that uses ammo.
 - **Weapons:** pistol, SMG, shotgun (7 pellets) and rifle (long range, hits hard). Stats are in [shared/src/weapons.ts](shared/src/weapons.ts).
 - **Terrain:** rocks and crates block bullets (crates break, and often drop loot); walls block bullets and sight; water slows you down; bushes hide you from anyone not right next to you; buildings have roofs that hide whoever is inside from people outside.
 - **Feedback:** a crosshair, hit markers and floating damage numbers when your shots land, muzzle flashes, a camera shake when you're hit, death bursts, a landing effect, and synthesized sound.
 - **After you're eliminated:** you see your place, kills, damage and survival time. You can spectate (switching between living players) or hit "Play again". The end of a match shows the winner and a kill leaderboard. Lifetime stats are kept in your browser and shown on the menu.
+- **Spectating:** press Spectate on the start menu to only watch: you follow players (click or Space for the next one), the plane during the drop, and aren't counted as a player or take a bot's place. A spectator on their own still gets a bots-only match to watch. Switch between playing and spectating with "Just spectate" in the Esc menu (not while you're alive in a match).
+- **Leaderboard:** the server keeps every named human player's wins, kills, matches and best place (by name, case-insensitive; no accounts), ranked by wins then kills. Open it from the start menu or the Esc menu. Bots and players who left the name blank aren't on it.
 - **Reconnection:** if your connection drops, you have 20 seconds to get back into the same match. The client retries automatically, and refreshing the page rejoins too.
 
 ## Layout
@@ -90,9 +105,10 @@ client/   Phaser scene (prediction, interpolation, rendering, effects), HTML HUD
 
 Bots ([server/src/Bot.ts](server/src/Bot.ts)) are ordinary players without a connection. Each tick their brain produces the same input message a human client sends, so they follow exactly the same rules.
 
-- **Difficulty** (chosen on the menu; each difficulty gets its own rooms) sets aim error, reaction time, how well they lead moving targets, and how far they look.
+- **Difficulty** (chosen on the start menu for a new game; anyone in a game can change it from the Esc menu, for everyone, from the next lobby) sets aim error, reaction time, how well they lead moving targets, how far they look, and how long they keep hunting someone who hid (3, 6 or 9 s).
 - **Personalities** are assigned at random. *Aggressive* bots close in and chase. *Campers* settle in a building or bush inside the zone and wait. *Looters* grab everything useful and back off early. *Balanced* is in between.
 - **Every bot** picks the right weapon slot for the distance, reloads and heals when it's safe, jumps from the plane at a random point, heads back inside the zone before it closes, and steers around obstacles.
+- **Hiding doesn't shake them.** A target that ducks into a bush, under a roof or behind a wall is hunted where it vanished: bots keep firing bursts into the bush, chasers (*aggressive*, *balanced*) go in after it, and the others hold their ground covering the spot until they forget. A bot shot by someone it can't see turns on the shooter, guessing where the shots came from.
 
 Bots carry a `[bot]` tag. Every player gets their own color (unique until there are more than 20 players), and you're marked with a white ring.
 
@@ -100,4 +116,5 @@ Bots carry a `[bot]` tag. Every player gets their own color (unique until there 
 
 - Bots steer locally rather than planning a path, so they can get briefly stuck in building corners (they detect it and pick a new destination).
 - Automatic reconnection only kicks in once a connection has been up for 5 seconds (an SDK rule). A drop in the first few seconds of joining sends you back to the menu.
+- The leaderboard trusts names: anyone can play under someone else's name.
 - Map generation is random per room. There's no seeding or hand-made map yet.

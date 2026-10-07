@@ -1,27 +1,30 @@
-import { type Client, Room } from "@colyseus/core";
+import { type Client, Room, ServerError } from "@colyseus/core";
 import { StateView } from "@colyseus/schema";
 import {
   ARMOR_ABSORB, BULLET_RADIUS, Bullet, CRATE_SIZE, DIFFICULTIES, DROP_SECONDS, type Difficulty,
-  ENDED_SECONDS, GameState, type HitMessage, INTERP_DELAY_MS, type InputMessage, type JoinOptions,
+  ENDED_SECONDS, ERR_SERVER_FULL, GameState, type HitMessage, INTERP_DELAY_MS, type InputMessage, type JoinOptions,
   KEY_HEAL, KEY_INTERACT, KEY_JUMP, KEY_MASK, KEY_RELOAD, type KillMessage, LAG_COMP_MAX_MS,
   LOBBY_SECONDS, LOOT_AMMO, LOOT_ARMOR, LOOT_MEDKIT, MAP_SIZE, MAX_ARMOR, MAX_HEALTH, MAX_MEDKITS,
   MAX_PLAYERS, MEDKIT_HEAL, MEDKIT_TICKS, MIN_PLAYERS_TO_START, MSG_HIT, MSG_INPUT, MSG_KILL,
-  MSG_LATENCY, MSG_MATCH_END, MSG_SPECTATE, MSG_SPECTATE_NEXT, MSG_STATS, MUZZLE_OFFSET,
+  MSG_LATENCY, MSG_MATCH_END, MSG_NOTICE, MSG_SETTINGS, MSG_SPECTATE, MSG_SPECTATE_NEXT, MSG_STATS, MUZZLE_OFFSET,
   type MatchEndMessage, PHASE_DROP, PHASE_ENDED, PHASE_LOBBY, PHASE_PLAYING, PICKUP_RADIUS,
-  PLAYER_COLORS, PLAYER_RADIUS, Player, RECONNECT_SECONDS, type SpectateMessage, type StatsMessage,
+  PLAYER_COLORS, PLAYER_RADIUS, Player, RECONNECT_SECONDS, type SettingsMessage, type SpectateMessage, type StatsMessage,
   TICK_DT, TICK_MS, TICK_RATE, WEAPONS, WEAPON_NONE, WEAPON_PISTOL, type Weapon, activeWeapon,
   ammoPickupAmount, ammoTarget, canSee, circleBlocked, giveWeapon, isWeaponLoot, magIn, maxReserve,
   raycastSolid, reserveIn, resetInventory, segmentCircleHit, setMag, setReserve, setSlotContents,
   stepPlayer, weaponIn,
 } from "@br/shared";
 import { Bot, type BotWorld, SKILL, botName, randomPersonality } from "./Bot";
+import { leaderboard } from "./leaderboard";
 import { type GeneratedMap, dropLoot, generateMap, randomLootType, resetCrates, spawnLoot } from "./map";
 import { ZoneController } from "./ZoneController";
 
 // Inputs applied per player per tick. Lets a client that stalled catch up a
 // little without letting it move faster than everyone else.
 const MAX_INPUTS_PER_TICK = 2;
-const MAX_QUEUED_INPUTS = 8;
+// Inputs that arrive in a burst after a network stall are buffered, not dropped:
+// the client has already predicted them, so dropping one makes it snap back.
+const MAX_QUEUED_INPUTS = TICK_RATE;
 
 const env = (name: string, fallback: number) => Number(process.env[name] ?? fallback);
 const MAP_COUNTS = {
@@ -38,6 +41,10 @@ const LOBBY_TICKS = env("LOBBY_SECONDS", LOBBY_SECONDS) * TICK_RATE;
 const DROP_TICKS = Math.max(1, env("DROP_SECONDS", DROP_SECONDS) * TICK_RATE);
 // > 1 speeds up the zone, for testing.
 const MATCH_SPEED = env("MATCH_SPEED", 1);
+// Games this process runs at once. All rooms share one CPU core, and a full one
+// costs about 6% of it, so this keeps a public server from being swamped.
+const MAX_ROOMS = env("MAX_ROOMS", 10);
+let roomCount = 0;
 
 // Position history for lag compensation, one slot per tick.
 const HISTORY_TICKS = Math.ceil(LAG_COMP_MAX_MS / TICK_MS) + 2;
@@ -64,6 +71,8 @@ interface PlayerMeta {
   watchId: string;
   /** Players currently in this client's StateView. */
   visible: Set<string>;
+  /** A human who picked a name, so their results go on the leaderboard. */
+  ranked: boolean;
 }
 
 interface BulletSim {
@@ -81,6 +90,7 @@ interface BulletSim {
 export class GameRoom extends Room<{ state: GameState }> {
   maxClients = MAX_PLAYERS;
 
+  /** The bots' current difficulty. `state.difficulty` is the chosen one, applied in the lobby. */
   private difficulty: Difficulty = "normal";
   private tick = 0;
   private phaseTicks = 0;
@@ -95,6 +105,9 @@ export class GameRoom extends Room<{ state: GameState }> {
   private botWorld!: BotWorld;
 
   onCreate(options?: JoinOptions) {
+    // Rejects the create; joinOrCreate only creates when every room is full.
+    if (roomCount >= MAX_ROOMS) throw new ServerError(ERR_SERVER_FULL, "The server is full. Try again in a minute.");
+    roomCount++;
     const requested = options?.difficulty;
     this.difficulty = requested && DIFFICULTIES.includes(requested) ? requested : "normal";
     this.setState(new GameState());
@@ -112,6 +125,7 @@ export class GameRoom extends Room<{ state: GameState }> {
       if (meta && typeof ms === "number" && Number.isFinite(ms)) meta.latencyMs = Math.max(0, Math.min(ms, 1000));
     });
     this.onMessage(MSG_SPECTATE_NEXT, (client) => this.spectateNext(client.sessionId));
+    this.onMessage(MSG_SETTINGS, (client, msg: SettingsMessage) => this.changeSettings(client.sessionId, msg));
 
     this.setPatchRate(TICK_MS);
     this.setFixedTimestep(() => this.update(), TICK_RATE);
@@ -120,9 +134,12 @@ export class GameRoom extends Room<{ state: GameState }> {
 
   onJoin(client: Client, options?: JoinOptions) {
     const player = new Player();
-    player.name = sanitizeName(options?.name) || `Player ${this.clients.length}`;
+    const name = sanitizeName(options?.name);
+    player.name = name || `Player ${this.clients.length}`;
+    player.spectator = options?.spectate === true;
     this.addPlayer(client.sessionId, player);
-    // Arrived mid-match (the room locks, but joins can race it): spectate until the next lobby.
+    this.meta.get(client.sessionId)!.ranked = !!name;
+    // Arrived mid-match: spectate until the next lobby.
     if (this.state.phase !== PHASE_LOBBY) player.alive = false;
     client.view = new StateView();
     this.balanceBots();
@@ -144,6 +161,10 @@ export class GameRoom extends Room<{ state: GameState }> {
     this.balanceBots();
   }
 
+  onDispose() {
+    roomCount--;
+  }
+
   // ---- Match flow -------------------------------------------------------
 
   private enterLobby() {
@@ -154,19 +175,17 @@ export class GameRoom extends Room<{ state: GameState }> {
     this.state.loot.clear();
     resetCrates(this.state, this.map);
     this.state.players.forEach((p, id) => this.resetPlayer(id, p));
+    this.applyDifficulty();
     this.balanceBots();
-    void this.unlock();
   }
 
   private startDrop() {
-    if (this.state.players.size < MIN_PLAYERS_TO_START) {
+    if (this.combatants() < MIN_PLAYERS_TO_START) {
       this.phaseTicks = LOBBY_TICKS;
       return;
     }
     this.state.phase = PHASE_DROP;
     this.phaseTicks = DROP_TICKS;
-    // Late joiners get matched into a fresh room instead.
-    void this.lock();
     this.clearBullets();
     spawnLoot(this.state, this.map.geo, OPEN_LOOT_COUNT, () => this.newId());
 
@@ -187,6 +206,7 @@ export class GameRoom extends Room<{ state: GameState }> {
 
     this.state.players.forEach((p, id) => {
       this.resetPlayer(id, p);
+      if (p.spectator) return;
       p.inPlane = true;
       p.x = plane.x0;
       p.y = plane.y0;
@@ -208,18 +228,70 @@ export class GameRoom extends Room<{ state: GameState }> {
     if (winnerId && winner) this.sendStats(winnerId, winner, 1, "");
 
     const leaderboard: MatchEndMessage["leaderboard"] = [];
-    this.state.players.forEach((p) => leaderboard.push({ name: p.name, kills: p.kills }));
+    this.state.players.forEach((p) => {
+      if (!p.spectator) leaderboard.push({ name: p.name, kills: p.kills });
+    });
     leaderboard.sort((a, b) => b.kills - a.kills);
     this.broadcast(MSG_MATCH_END, {
       winner: winner?.name ?? "", winnerId: winnerId ?? "", leaderboard: leaderboard.slice(0, 5),
     } satisfies MatchEndMessage);
   }
 
+  /** From the in-game menu. Anyone can change the bots; that applies to everyone, from the lobby. */
+  private changeSettings(id: string, msg: SettingsMessage) {
+    const player = this.state.players.get(id);
+    if (!player || typeof msg !== "object" || msg === null) return;
+    const name = sanitizeName(msg.name);
+    if (name) {
+      player.name = name;
+      this.meta.get(id)!.ranked = !player.bot;
+    }
+    const difficulty = msg.difficulty;
+    if (difficulty && DIFFICULTIES.includes(difficulty) && difficulty !== this.state.difficulty) {
+      this.state.difficulty = difficulty;
+      const now = this.state.phase === PHASE_LOBBY;
+      if (now) this.applyDifficulty();
+      this.broadcast(MSG_NOTICE, `${player.name} set the bots to ${difficulty}${now ? "" : " from the next match"}`);
+    }
+    if (typeof msg.spectate === "boolean" && msg.spectate !== player.spectator) this.setSpectator(id, player, msg.spectate);
+  }
+
+  /** Not while alive in a match: that would be a free way out of a losing fight. */
+  private setSpectator(id: string, p: Player, on: boolean) {
+    const phase = this.state.phase;
+    if (p.alive && (phase === PHASE_DROP || phase === PHASE_PLAYING)) return;
+    p.spectator = on;
+    // In the lobby, step into or out of the crowd now; otherwise players come back at the next lobby.
+    if (phase === PHASE_LOBBY) this.resetPlayer(id, p);
+    else if (on) p.alive = false;
+    this.balanceBots();
+  }
+
+  /** Players taking part in matches: everyone but spectators. */
+  private combatants(): number {
+    let n = 0;
+    this.state.players.forEach((p) => {
+      if (!p.spectator) n++;
+    });
+    return n;
+  }
+
+  private applyDifficulty() {
+    this.difficulty = this.state.difficulty as Difficulty;
+    for (const bot of this.bots.values()) bot.skill = SKILL[this.difficulty];
+  }
+
   private balanceBots() {
     // Bots can't drop into a match in progress; fix the count at the next lobby.
     if (this.state.phase !== PHASE_LOBBY) return;
-    const humans = this.clients.length;
-    const wanted = humans === 0 ? 0 : Math.max(0, Math.min(BOT_FILL, MAX_PLAYERS) - humans);
+    let humans = 0;
+    let spectators = 0;
+    this.state.players.forEach((p) => {
+      if (p.spectator) spectators++;
+      else if (!p.bot) humans++;
+    });
+    // Spectators on their own still get a bots-only match to watch.
+    const wanted = humans + spectators === 0 ? 0 : Math.max(0, Math.min(BOT_FILL, MAX_PLAYERS) - humans);
     while (this.bots.size < wanted) {
       const id = `bot-${this.botsCreated}`;
       const player = new Player();
@@ -240,7 +312,7 @@ export class GameRoom extends Room<{ state: GameState }> {
     this.meta.set(id, {
       inputs: [], lastQueuedSeq: 0, prevKeys: 0, prevSlot: 0, nextFireTick: 0, reloadDoneTick: 0, healDoneTick: 0,
       zoneDamage: 0, latencyMs: 0, histX: new Float32Array(HISTORY_TICKS), histY: new Float32Array(HISTORY_TICKS),
-      histFrom: this.tick, damageDealt: 0, spawnTick: this.tick, watchId: "", visible: new Set(),
+      histFrom: this.tick, damageDealt: 0, spawnTick: this.tick, watchId: "", visible: new Set(), ranked: false,
     });
     player.color = this.pickColor();
     this.state.players.set(id, player);
@@ -266,7 +338,7 @@ export class GameRoom extends Room<{ state: GameState }> {
     p.hp = MAX_HEALTH;
     p.armor = 0;
     p.kills = 0;
-    p.alive = true;
+    p.alive = !p.spectator;
     p.inPlane = false;
     resetInventory(p);
     this.placeAtSpawn(p);
@@ -410,7 +482,7 @@ export class GameRoom extends Room<{ state: GameState }> {
       }
     });
     this.setIfChanged("aliveCount", alive);
-    this.setIfChanged("playerCount", this.state.players.size);
+    this.setIfChanged("playerCount", this.combatants());
     if (this.combat && alive <= 1) this.endMatch(last);
 
     this.updateViews();
@@ -438,8 +510,10 @@ export class GameRoom extends Room<{ state: GameState }> {
     pos.x = player.x;
     pos.y = player.y;
     stepPlayer(pos, input.keys, this.map.geo);
-    player.x = pos.x;
-    player.y = pos.y;
+    // Positions go over the wire as float32; keep the server on the same values
+    // so the client's replay from them matches the server bit for bit.
+    player.x = Math.fround(pos.x);
+    player.y = Math.fround(pos.y);
 
     if (!this.combat) return;
 
@@ -614,7 +688,11 @@ export class GameRoom extends Room<{ state: GameState }> {
         x: Math.round(victim.x), y: Math.round(victim.y), damage: dealt, kill: victim.hp === 0,
       } satisfies HitMessage);
     }
-    if (victim.hp > 0) return;
+    if (victim.hp > 0) {
+      const shooter = attackerId ? this.state.players.get(attackerId) : undefined;
+      if (shooter) this.bots.get(victimId)?.onHurt(victim, attackerId!, shooter.x, shooter.y, this.map.geo, this.tick);
+      return;
+    }
 
     victim.alive = false;
     victim.healing = false;
@@ -648,9 +726,11 @@ export class GameRoom extends Room<{ state: GameState }> {
     else this.sendSpectate(victimId);
   }
 
+  /** A player's match is over: tell them how it went, and record it. */
   private sendStats(id: string, p: Player, place: number, killer: string) {
     const meta = this.meta.get(id);
     if (!meta) return;
+    if (meta.ranked) leaderboard.record(p.name, { place, kills: p.kills, damage: meta.damageDealt });
     this.clients.getById(id)?.send(MSG_STATS, {
       place,
       kills: p.kills,
@@ -719,7 +799,8 @@ export class GameRoom extends Room<{ state: GameState }> {
       const view = client.view;
       if (!meta || !self || !view) continue;
 
-      if (!self.alive && this.state.phase !== PHASE_LOBBY && !players.get(meta.watchId)?.alive) {
+      const watching = !self.alive && (self.spectator || this.state.phase !== PHASE_LOBBY);
+      if (watching && !players.get(meta.watchId)?.alive) {
         this.spectateNext(id);
       }
       const viewerId = self.alive ? id : meta.watchId || id;

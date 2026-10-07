@@ -2,11 +2,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client, type Room } from "@colyseus/sdk";
 import {
   GameState, KEY_DOWN, KEY_INTERACT, KEY_JUMP, KEY_LEFT, KEY_RELOAD, KEY_RIGHT, KEY_UP, MSG_INPUT,
-  PHASE_DROP, PHASE_PLAYING, WEAPONS, WEAPON_NONE, WEAPON_PISTOL, isWeaponLoot, magIn,
+  PHASE_DROP, PHASE_PLAYING, WEAPONS, WEAPON_NONE, WEAPON_PISTOL, emptyGeometry, isWeaponLoot, magIn,
+  stepPlayer,
 } from "@br/shared";
 
 // An empty map and no bots, so a client can walk straight to loot.
 Object.assign(process.env, {
+  LEADERBOARD_FILE: "",
   LOBBY_SECONDS: "1", DROP_SECONDS: "1", BOT_FILL: "0", OBSTACLE_COUNT: "0", BUILDING_COUNT: "0",
   POND_COUNT: "0", BUSH_COUNT: "0", CRATE_COUNT: "0", LOOT_COUNT: "60",
 });
@@ -40,11 +42,32 @@ describe("inventory over the network", () => {
       room.send(MSG_INPUT, { seq: ++seq, keys, angle: extra.angle ?? 0, fire: extra.fire ?? false, slot: extra.slot ?? me().slot });
     const me = () => room.state.players.get(room.sessionId)!;
     const phase = (): string => room.state.phase;
+    // Wait until the server has applied everything sent so far (polling, since
+    // ticks lag when the other test files load the CPU).
+    const applied = async () => {
+      for (let i = 0; i < 150 && me().lastSeq !== seq; i++) await sleep(20);
+      expect(me().lastSeq).toBe(seq);
+    };
 
     while (phase() !== PHASE_DROP) await sleep(50);
     send(KEY_JUMP);
     send(0);
     while (me().inPlane) await sleep(50);
+
+    // A burst of inputs (as after a network stall) is applied in full, exactly
+    // as the client predicts it, so reconciliation has nothing to correct.
+    await applied();
+    const predicted = { x: me().x, y: me().y };
+    for (let i = 0; i < 20; i++) {
+      const keys = i % 2 ? KEY_DOWN | KEY_RIGHT : KEY_RIGHT;
+      send(keys);
+      stepPlayer(predicted, keys, emptyGeometry());
+      predicted.x = Math.fround(predicted.x);
+      predicted.y = Math.fround(predicted.y);
+    }
+    await applied();
+    expect(me().x).toBe(predicted.x);
+    expect(me().y).toBe(predicted.y);
 
     // Walk to the nearest weapon lying around.
     const nearest = () => {
@@ -64,7 +87,7 @@ describe("inventory over the network", () => {
     }
     send(KEY_INTERACT);
     send(0);
-    await sleep(300);
+    await applied();
     expect(me().w1).toBe(target.type);
     expect(me().slot).toBe(1);
     expect(magIn(me(), 1)).toBe(WEAPONS[target.type].mag);
@@ -77,19 +100,21 @@ describe("inventory over the network", () => {
       await sleep(33);
     }
     send(0);
-    await sleep(200);
+    await applied();
     expect(magIn(me(), 1)).toBeLessThan(before);
 
     send(KEY_RELOAD);
     send(0);
-    await sleep(200);
+    await applied();
     expect(me().reloading).toBe(true);
-    await sleep(WEAPONS[target.type].reloadTicks * 34 + 300);
+    // Poll rather than sleep a fixed time: ticks lag when the other test files load the CPU.
+    const reloadBy = Date.now() + WEAPONS[target.type].reloadTicks * 34 + 3000;
+    while (me().reloading && Date.now() < reloadBy) await sleep(50);
     expect(me().reloading).toBe(false);
     expect(magIn(me(), 1)).toBe(WEAPONS[target.type].mag);
 
     send(0, { slot: 0 });
-    await sleep(200);
+    await applied();
     expect(me().slot).toBe(0);
     expect(me().w0).toBe(WEAPON_PISTOL);
     expect(me().w1).not.toBe(WEAPON_NONE);

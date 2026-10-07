@@ -21,6 +21,8 @@
         </select>
       </label>
       <button type="submit">Play</button>
+      <button id="spectate-button" type="button" class="secondary">Spectate</button>
+      <button id="board-button" type="button" class="secondary">Leaderboard</button>
       <p class="hint desktop-only">WASD move · mouse aim · click shoot · 1/2/Q switch weapon · R reload · H heal · E pick up · Space jump</p>
       <p id="career" class="hint"></p>
       <p id="menu-error" class="error"></p>
@@ -28,6 +30,7 @@
 
     <div id="hud" hidden>
       <div id="stats"><span id="alive"></span> · <span id="kills"></span> kills · <span id="ping"></span></div>
+      <button id="menu-button" type="button" aria-label="Menu">☰</button>
       <div id="status"></div>
       <div id="feed"></div>
 
@@ -65,6 +68,36 @@
         <button type="button" data-action="reload">Reload</button>
         <button type="button" data-action="heal">Heal</button>
       </div>
+    </div>
+
+    <form id="pause" class="overlay" hidden>
+      <h1>Menu</h1>
+      <input id="pause-name" maxlength="16" placeholder="Your name" autocomplete="off" />
+      <label class="field">Bots
+        <select id="pause-difficulty">
+          <option value="easy">Easy</option>
+          <option value="normal">Normal</option>
+          <option value="hard">Hard</option>
+        </select>
+      </label>
+      <p id="pause-note" class="hint"></p>
+      <label class="field check"><input id="pause-spectate" type="checkbox" /> Just spectate</label>
+      <p id="pause-spectate-note" class="hint"></p>
+      <button type="submit">Resume</button>
+      <button id="pause-board" type="button" class="secondary">Leaderboard</button>
+      <p class="hint desktop-only">Esc to resume</p>
+    </form>
+
+    <div id="board" class="overlay" hidden>
+      <h1>Leaderboard</h1>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th class="name">Name</th><th>Wins</th><th>Kills</th><th>Matches</th><th>Best</th></tr></thead>
+          <tbody id="board-rows"></tbody>
+        </table>
+      </div>
+      <p id="board-status" class="hint"></p>
+      <button id="board-close" type="button">Close</button>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

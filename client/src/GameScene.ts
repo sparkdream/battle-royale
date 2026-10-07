@@ -5,7 +5,7 @@ import {
   type InputMessage, KEY_DOWN, KEY_HEAL, KEY_INTERACT, KEY_JUMP, KEY_LEFT, KEY_RELOAD, KEY_RIGHT,
   KEY_UP, type KillMessage, LOOT_AMMO, LOOT_ARMOR, LOOT_MEDKIT, type Loot, MAP_SIZE, MAX_HEALTH,
   MEDKIT_TICKS, MSG_HIT, MSG_INPUT, MSG_KILL, MSG_LATENCY, MSG_MATCH_END, MSG_SPECTATE,
-  MSG_SPECTATE_NEXT, MSG_STATS, type MapGeometry, type MatchEndMessage, PHASE_DROP, PHASE_ENDED,
+  MSG_NOTICE, MSG_SPECTATE_NEXT, MSG_STATS, type MapGeometry, type MatchEndMessage, PHASE_DROP, PHASE_ENDED,
   PHASE_LOBBY, PHASE_PLAYING, PICKUP_RADIUS, PLAYER_COLORS, PLAYER_RADIUS, type Player,
   type SpectateMessage, type StatsMessage, TICK_MS, WEAPONS, WEAPON_NONE, emptyGeometry,
   firstSolidHit, inCircles, inRects, isWeaponLoot, magIn, reserveIn, stepPlayer, weaponIn,
@@ -23,6 +23,9 @@ const CORRECTION_DECAY = 15; // per second
 const HEARING_RANGE = 1300;
 const ZONE_FOG = 0x5a1478;
 const HIT_MARKER_MS = 140;
+// Fraction of the way the camera closes on a spectate target each frame: eases
+// out the jitter of someone else's movement (and glides between targets).
+const SPECTATE_CAMERA_LERP = 0.2;
 
 const DEPTH = {
   water: 0.5, floor: 1, loot: 6, solid: 7, player: 10, bullet: 12, flash: 13, bush: 14, roof: 15,
@@ -81,6 +84,8 @@ export class GameScene extends Phaser.Scene {
   private crosshair!: Phaser.GameObjects.Graphics;
   private plane!: Phaser.GameObjects.Container;
   private disposed = false;
+  /** The in-game menu is open: send no movement or actions. */
+  private paused = false;
 
   private views = new Map<string, PlayerView>();
   private bullets = new Map<string, BulletView>();
@@ -99,6 +104,8 @@ export class GameScene extends Phaser.Scene {
   private mine: OwnState | null = null;
   private actionStart = 0;
   private hitMarkerUntil = 0;
+  /** Whether the crosshair is drawn, standing in for the hidden mouse cursor. */
+  private aiming = false;
   private planeT = { value: 0, at: 0 };
 
   // Client-side prediction of the local player.
@@ -148,6 +155,7 @@ export class GameScene extends Phaser.Scene {
     };
     this.room.onStateChange(live(() => this.onPatch()));
     this.room.onMessage(MSG_KILL, live((msg: KillMessage) => this.hud.kill(msg)));
+    this.room.onMessage(MSG_NOTICE, live((text: string) => this.hud.notice(text)));
     this.room.onMessage(MSG_HIT, live((msg: HitMessage) => this.onHit(msg)));
     this.room.onMessage(MSG_STATS, live((msg: StatsMessage) => this.onStats(msg)));
     this.room.onMessage(MSG_SPECTATE, live((msg: SpectateMessage) => this.onSpectate(msg)));
@@ -176,6 +184,21 @@ export class GameScene extends Phaser.Scene {
   /** Stop reacting to the room. Phaser destroys scenes a frame late, so call this first. */
   dispose() {
     this.disposed = true;
+    this.setAiming(false);
+  }
+
+  /** For the in-game menu: stop game input and let keys reach the menu's fields. */
+  setPaused(paused: boolean) {
+    this.paused = paused;
+    const kb = this.input?.keyboard;
+    if (!kb) return;
+    kb.enabled = !paused;
+    if (paused) {
+      kb.disableGlobalCapture();
+      kb.resetKeys();
+    } else {
+      kb.enableGlobalCapture();
+    }
   }
 
   /** Switch to the other weapon slot (also used by the touch Swap button). */
@@ -210,7 +233,7 @@ export class GameScene extends Phaser.Scene {
     if (!me || !me.alive) return;
 
     const k = this.keys;
-    let keys = this.touch?.keys() ?? 0;
+    let keys = this.paused ? 0 : this.touch?.keys() ?? 0;
     if (k.W.isDown || k.UP.isDown) keys |= KEY_UP;
     if (k.S.isDown || k.DOWN.isDown) keys |= KEY_DOWN;
     if (k.A.isDown || k.LEFT.isDown) keys |= KEY_LEFT;
@@ -222,7 +245,7 @@ export class GameScene extends Phaser.Scene {
     if (pressed(k.H)) keys |= KEY_HEAL;
     const jump = pressed(k.SPACE);
 
-    const mouseDown = !this.touch && this.input.activePointer.leftButtonDown();
+    const mouseDown = !this.paused && !this.touch && this.input.activePointer.leftButtonDown();
     if (me.inPlane) {
       if (jump || mouseDown) keys |= KEY_JUMP;
       this.room.send(MSG_INPUT, { seq: ++this.seq, keys, angle: this.aim, fire: false, slot: this.wantSlot } satisfies InputMessage);
@@ -251,7 +274,17 @@ export class GameScene extends Phaser.Scene {
 
   private spectateNextIfDead() {
     const me = this.me();
-    if (me && !me.alive && this.room.state.phase !== PHASE_LOBBY) this.room.send(MSG_SPECTATE_NEXT);
+    if (me && this.watching(me)) this.room.send(MSG_SPECTATE_NEXT);
+  }
+
+  /** Looking through someone else's eyes: out of the match, or a spectator (also in the lobby). */
+  private watching(me: Player) {
+    return !me.alive && (me.spectator || this.room.state.phase !== PHASE_LOBBY);
+  }
+
+  /** A watcher with nobody to watch during the drop (everyone's aboard) follows the plane. */
+  private watchingPlane(me: Player) {
+    return this.watching(me) && this.room.state.phase === PHASE_DROP && !this.views.has(this.spectateId);
   }
 
   private onPatch() {
@@ -432,7 +465,8 @@ export class GameScene extends Phaser.Scene {
     this.lastPhase = phase;
     if (phase === PHASE_LOBBY || phase === PHASE_DROP) {
       this.hud.hideBanner();
-      this.spectateId = "";
+      // A spectator keeps watching; the server may already have sent the next target.
+      if (!this.me()?.spectator) this.spectateId = "";
       this.stats = null;
       this.wantSlot = 0;
     }
@@ -607,8 +641,8 @@ export class GameScene extends Phaser.Scene {
   private eyePosition(): { x: number; y: number } | null {
     const me = this.me();
     if (!me) return null;
-    if (me.inPlane) return { x: this.plane.x, y: this.plane.y };
-    if (me.alive || this.room.state.phase === PHASE_LOBBY) return this.renderPos;
+    if (me.inPlane || this.watchingPlane(me)) return { x: this.plane.x, y: this.plane.y };
+    if (!this.watching(me)) return this.renderPos;
     const followed = this.views.get(this.spectateId)?.root;
     return followed ? { x: followed.x, y: followed.y } : null;
   }
@@ -619,23 +653,25 @@ export class GameScene extends Phaser.Scene {
     if (!me) return;
     let id = this.room.sessionId;
     let target = this.views.get(id)?.root;
-    if (me.inPlane) {
+    if (me.inPlane || this.watchingPlane(me)) {
       id = "plane";
       target = this.plane;
-    } else if (!me.alive && this.room.state.phase !== PHASE_LOBBY && this.views.has(this.spectateId)) {
+    } else if (this.watching(me) && this.views.has(this.spectateId)) {
       id = this.spectateId;
       target = this.views.get(id)!.root;
     }
     if (!target || id === this.followId) return;
     this.followId = id;
-    this.cameras.main.startFollow(target, true);
+    const lerp = id === this.spectateId ? SPECTATE_CAMERA_LERP : 1;
+    this.cameras.main.startFollow(target, true, lerp, lerp);
   }
 
   private renderCrosshair() {
     const g = this.crosshair;
     g.clear();
     const me = this.me();
-    if (this.touch || !me?.alive || me.inPlane) return;
+    this.setAiming(!this.touch && !!me?.alive && !me.inPlane);
+    if (!this.aiming) return;
     const pointer = this.input.activePointer;
     const { x, y } = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
     const hit = performance.now() < this.hitMarkerUntil;
@@ -648,12 +684,20 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  /** The mouse cursor is hidden only while the crosshair replaces it (not when dead or in the plane). */
+  private setAiming(on: boolean) {
+    if (on === this.aiming) return;
+    this.aiming = on;
+    document.body.classList.toggle("aiming", on);
+  }
+
   private updateHud() {
     const state = this.room.state;
     const me = this.me();
     if (!me) return;
     const onGround = me.alive && !me.inPlane;
     this.hud.setStats(state.aliveCount, me.kills);
+    this.hud.setSpectator(me.spectator);
     this.hud.setHp(me.alive ? me.hp : 0);
     this.hud.setArmor(me.alive ? me.armor : 0);
     this.hud.setMedkits(me.medkits);
@@ -699,10 +743,13 @@ export class GameScene extends Phaser.Scene {
 
   private prompt(me: Player): string {
     const touch = !!this.touch;
-    if (!me.alive) return "";
-    if (me.inPlane) return touch ? "Tap Jump to drop" : "Space or click to jump";
     const phase = this.room.state.phase;
-    if (phase !== PHASE_PLAYING && phase !== PHASE_DROP) return "";
+    const running = phase === PHASE_PLAYING || phase === PHASE_DROP;
+    if (me.spectator) return [`Spectating${touch ? "" : " · Esc to play"}`, this.spectateHint()].filter(Boolean).join(". ");
+    // Dead without an elimination: we joined mid-match and are spectating.
+    if (!me.alive) return running && !this.stats ? `Match in progress · you'll play the next one. ${this.spectateHint()}` : "";
+    if (me.inPlane) return touch ? "Tap Jump to drop" : "Space or click to jump";
+    if (!running) return "";
     const loot = this.nearestWeaponLoot();
     if (loot) {
       const full = me.w0 !== WEAPON_NONE && me.w1 !== WEAPON_NONE;

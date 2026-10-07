@@ -33,6 +33,8 @@ export const Player = schema({
   healing: t.boolean().default(false),
   /** Still in the drop plane: invisible, untouchable, follows the plane. */
   inPlane: t.boolean().default(false),
+  /** Only watches: never alive, not counted, takes no bot's place. */
+  spectator: t.boolean().default(false),
 }, "Player");
 export type Player = SchemaType<typeof Player>;
 
