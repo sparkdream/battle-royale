@@ -1,0 +1,51 @@
+---
+# SDL for running the game on Akash. See "Deploy to Akash" in the README.
+# The image tag matches the git tag of the release (vX.Y.Z).
+version: "2.0"
+services:
+  game:
+    image: sparkdreamnft/battle-royale:v1.0.0
+    expose:
+      - port: 2567
+        as: 80
+        proto: tcp
+        to:
+          - global: true
+        accept:
+          - battle.sparkdream.io   # proxied through Cloudflare for HTTPS
+    env:
+      - "NODE_ENV=production"
+      - "PORT=2567"
+      - "MAX_ROOMS=10"
+    params:
+      storage:
+        # The leaderboard. Survives restarts and updates, not closing the lease.
+        data:
+          mount: /app/data
+          readOnly: false
+profiles:
+  compute:
+    game:
+      resources:
+        cpu:
+          units: 1
+        memory:
+          size: 1Gi
+        storage:
+          - size: 1Gi
+          - name: data
+            size: 1Gi
+            attributes:
+              persistent: true
+              class: beta3
+  placement:
+    dcloud:
+      pricing:
+        game:
+          denom: uact
+          amount: 10000
+deployment:
+  game:
+    dcloud:
+      profile: game
+      count: 1

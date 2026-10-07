@@ -68,6 +68,29 @@ All games run on one CPU core: a full game (50 players and bots) uses about 6% o
 
 One container (about 375 MB) serves the game page and the game server on port 2567. Put it behind a proxy that supports WebSockets for HTTPS. GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the typecheck, tests and build, and builds the Docker image, on every push.
 
+### Deploy to Akash
+
+The game runs on [Akash](https://akash.network) at https://battle.sparkdream.io, deployed with [deploy.yaml](deploy.yaml): 1 CPU, 1 GB of memory, and a 1 GB persistent volume for the leaderboard. Each release is a version `vX.Y.Z` used for the git tag, the image tag and `version` in `package.json`.
+
+```bash
+# Bump "version" in package.json and the image tag in deploy.yaml, commit, then:
+git tag v1.0.0 && git push origin main v1.0.0
+
+docker build -t sparkdreamnft/battle-royale:v1.0.0 .
+docker push sparkdreamnft/battle-royale:v1.0.0
+
+# Create the deployment (or paste deploy.yaml into Akash Console)
+akash tx deployment create deploy.yaml --from <key> --chain-id akashnet-2 --node <akash-rpc>
+```
+
+The Spark Dream launcher can deploy it too: in a services fleet (or a chain fleet), **+ add component… → Battle royale**, with the domain. The launcher pins the image tag in its profiles (`BATTLE_IMAGE` in `packages/launch-spec/src/profiles.ts`); bump it there when you release.
+
+To release a new version, push the new image and update the existing deployment with the new tag (Console: Update; CLI: `akash tx deployment update deploy.yaml ...`). An update keeps the lease and the leaderboard. Always use a new tag: providers cache images, so a reused tag may not update.
+
+**HTTPS.** Akash providers serve plain HTTP on port 80. `battle.sparkdream.io` is a proxied Cloudflare CNAME to the lease's ingress hostname (`<id>.ingress.<provider>`), with SSL mode *Flexible*, like the other services. Cloudflare passes WebSockets through, and the client connects to the origin that served the page, so the image has no domain built in. Recreating the deployment (rather than updating it) gives a new ingress hostname: update the CNAME.
+
+**Leaderboard.** It lives on the persistent volume, which survives restarts and updates but not closing the lease or moving to another provider. Copy `/app/data/leaderboard.json` out first (Console's shell, or `provider-services lease-shell`) if you want to keep it.
+
 ## The game
 
 - **Match flow:** a lobby (walk around, no shooting), then the **drop**, the match itself, and results, then back to the lobby. During the drop a plane crosses the map and you jump whenever you like (or get dropped at the end of its path). There are no respawns. Players who join after the plane leaves spectate the match in progress and play from the next one; new players are matched into the room with the most humans, so friends on a LAN end up together.

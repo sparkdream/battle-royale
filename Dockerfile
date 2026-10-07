@@ -22,6 +22,7 @@ COPY --from=build /app/client/dist client/dist
 # The leaderboard; mount a volume here to keep it across containers.
 RUN mkdir data && chown node:node data
 VOLUME /app/data
-USER node
 EXPOSE 2567
+# Starts as root only to take ownership of the data volume, then runs as node.
+ENTRYPOINT ["server/entrypoint.sh"]
 CMD ["npm", "start"]
