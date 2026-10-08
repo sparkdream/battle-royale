@@ -2,6 +2,7 @@
 **/dist
 .git
 CLAUDE.md
+.claude
 *.log
 .env
 data
