@@ -17,9 +17,20 @@ services:
       - "NODE_ENV=production"
       - "PORT=2567"
       - "MAX_ROOMS=10"
+      # Web3 (Spark Dream devnet). CHAIN_MNEMONIC is the relayer account: a
+      # funded key that is an active x/rep member (it creates the game's
+      # artifact classes and signs every match write). Inject it as a secret,
+      # never commit it. Without CHAIN_ENABLED the game runs without web3.
+      - "CHAIN_ENABLED=1"
+      - "CHAIN_RPC=https://rpc-dev.sparkdream.io"
+      - "CHAIN_LCD=https://api-dev.sparkdream.io"
+      - "CHAIN_ID=sparkdream-dev-1"
+      - "CHAIN_DENOM=usparz.sparkdreamdev"
+      - "PUBLIC_URL=https://battle.sparkdream.io"   # base of match token uris
+      # - "CHAIN_MNEMONIC=<secret>"
     params:
       storage:
-        # The leaderboard. Survives restarts and updates, not closing the lease.
+        # The profile database. Survives restarts and updates, not closing the lease.
         data:
           mount: /app/data
           readOnly: false

@@ -3,7 +3,11 @@ dist/
 *.log
 .DS_Store
 .env
-# Server-side leaderboard
+# Server-side profile database
 data/
 CLAUDE.md
 .claude/
+# ZCode editor plans
+.zcode/
+# Syncthing folder marker (per machine)
+.stfolder/

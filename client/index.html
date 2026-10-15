@@ -20,6 +20,11 @@
           <option value="hard">Hard</option>
         </select>
       </label>
+      <div id="wallet-row" hidden>
+        <button id="connect-wallet" type="button" class="secondary">Connect Keplr</button>
+        <span id="wallet-chip" class="chip" hidden></span>
+      </div>
+      <p id="wallet-note" class="hint" hidden></p>
       <button type="submit">Play</button>
       <button id="spectate-button" type="button" class="secondary">Spectate</button>
       <button id="board-button" type="button" class="secondary">Leaderboard</button>
@@ -41,6 +46,7 @@
         <ol id="banner-board"></ol>
         <button id="play-again" type="button" hidden>Play again</button>
         <div id="banner-hint"></div>
+        <div id="banner-web3" hidden></div>
       </div>
 
       <div id="bottom">
@@ -97,6 +103,11 @@
         </table>
       </div>
       <p id="board-status" class="hint"></p>
+      <div id="board-web3" hidden>
+        <h2>Onchain career</h2>
+        <p id="board-career" class="hint"></p>
+        <div id="achv-list"></div>
+      </div>
       <button id="board-close" type="button">Close</button>
     </div>
 

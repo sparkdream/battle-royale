@@ -51,9 +51,77 @@ New-NetFirewallHyperVRule -Name BattleRoyaleDev -DisplayName "Battle royale dev"
 | `OBSTACLE_COUNT` / `BUILDING_COUNT` / `POND_COUNT` / `BUSH_COUNT` / `CRATE_COUNT` | `110` / `10` / `6` / `45` / `35` | Map generation |
 | `LOOT_COUNT` | `90` | Loot outside buildings (each building also gets 2–4) |
 | `MAX_ROOMS` | `10` | Most games running at once. Past it, new games are refused ("server is full") and players join an existing one |
-| `LEADERBOARD_FILE` | `data/leaderboard.json` | Where the server keeps the leaderboard. Empty: memory only |
+| `DB_FILE` | `data/game.db` | SQLite file with guest profiles, the leaderboard, achievements and funnel counts. Empty: memory only |
+| `ADMIN_TOKEN` | unset | Turns on `GET /admin/funnel` (funnel counts as JSON), which then needs `Authorization: Bearer <ADMIN_TOKEN>` |
+| `CHAIN_ENABLED` | `0` | `1` turns on onchain recording (needs `CHAIN_MNEMONIC`) |
+| `CHAIN_MNEMONIC` | — | The relayer account's mnemonic. A funded, x/rep-membered key that signs every game tx |
+| `CHAIN_RPC` / `CHAIN_LCD` | sparkdream devnet | Endpoints of the chain to write to |
+| `CHAIN_ID` / `CHAIN_DENOM` / `CHAIN_PREFIX` | `sparkdream-dev-1` / `usparz.sparkdreamdev` / `sprkdrm` | Chain identity |
+| `CHAIN_GAS_PRICE` | `0.025usparz.sparkdreamdev` | Gas price for relayer txs |
+| `CHAIN_EXPLORER` | `https://explorer-devnet.sparkdream.io/sparkdream` | Where tx links point |
+| `PUBLIC_URL` | unset | This server's public origin (e.g. `https://battle.sparkdream.io`), the base of match token uris. Unset: uris are bare `/matches/<id>` paths |
 
 For example, `BOT_FILL=20 LOBBY_SECONDS=5 MATCH_SPEED=4 npm run dev`.
+
+## Web3: Spark Dream chain
+
+Optional, off by default. When enabled, players can connect Keplr and get
+their results recorded on a Spark Dream chain through its **x/artifact**
+module — no game-specific chain code:
+
+- **Identity.** "Connect Keplr" in the menu signs a server nonce
+  (`/auth/nonce` → `signArbitrary` → `/auth/verify`). The proof returns a
+  secret ticket that travels with every join, alongside the guest profile,
+  so results are also recorded against the address (the address itself is
+  public, so it is never the credential).
+- **Career records.** One soulbound `BRCAREER` token per linked player,
+  metadata updated after every match: matches, wins, kills, damage, best
+  place, items collected (by type), crates broken, maps played, achievements.
+  The token is the onchain leaderboard — `/leaderboard` reads the class and
+  merges it with the profiles (onchain rows win name collisions, which also
+  keeps a linked player from showing up twice).
+- **Achievement badges.** The same achievements profiles earn
+  ([shared/src/achievements.ts](shared/src/achievements.ts)), evaluated
+  against the onchain career at match end; each unlock mints a soulbound
+  `BRBADGE` token to the player, with the achievement's code as an attribute.
+- **Map collectibles.** Map layouts are now generated from a seed
+  (same seed → identical map; the map id is a hash of seed + counts). The
+  winner of each match is minted a transferable `BRMAP` token carrying the
+  seed, so the ground a victory happened on can be regenerated and verified.
+- **Match records.** Every match with a linked player also mints one
+  soulbound `BRMATCH` token to the relayer: a ledger entry, not a collectible.
+  Its attributes are minimal (match id, map, seed, end time, player count,
+  winner); its `uri` points at `GET /matches/<id>` on the game server, which
+  serves the full result (every participant, bots included, with place,
+  kills, damage, items and crates), and its `uriHash` is the sha256 of
+  exactly those bytes. Career tokens carry `last_match`, so a career can be
+  audited match by match. Records are kept in the profile database for every
+  match with a human in it, chain or not. Each token costs the relayer the
+  usual 0.1 SPARK deposit plus gas; at thousands of matches a day, switch to
+  periodic checkpoint tokens (one per period holding a Merkle root).
+- **UX.** Server-relayer model: the game server signs all chain writes, so
+  players get exactly one Keplr popup (the login signature), never per match.
+  Everything degrades gracefully: no wallet → guest-profile play; chain
+  down → results still count in the profile and the write is skipped.
+
+### Running it against the devnet
+
+1. **Relayer account.** Generate a mnemonic (`sparkdreamd keys add br-relayer`),
+   fund it with the fee denom (devnet faucet or an operator account; class
+   creation burns 10 SPARK, each live token deposits 0.1 SPARK, gas is per
+   tx), and have an existing member invite it so it becomes an **active
+   x/rep member** — class creation requires trust level ≥ 1, and membership
+   also makes it a *trusted sender* so badge/career mints land directly in
+   players' wallets instead of their inboxes.
+2. **Configure.**
+   `CHAIN_ENABLED=1 CHAIN_MNEMONIC="… tvrq …" npm run dev`
+   (all `CHAIN_*` variables listed above).
+3. **Play.** The menu shows "Connect Keplr"; the server logs the relayer
+   address and the resolved class ids on boot. The four classes are created
+   automatically the first time.
+
+`@sparkdreamnft/sparkdreamjs` is the only chain client: its signing client
+signs the relayer's txs and its query client reads tokens back.
 
 ## Deploy
 
@@ -62,7 +130,7 @@ docker build -t battle-royale .
 docker run -p 2567:2567 -v br-data:/app/data battle-royale
 ```
 
-The volume keeps the leaderboard when the container is replaced.
+The volume keeps the profile database (and so the leaderboard) when the container is replaced.
 
 All games run on one CPU core: a full game (50 players and bots) uses about 6% of a core and each client about 10 KB/s, so the default `MAX_ROOMS=10` (500 connections) leaves plenty of headroom on a small server. Raise it on a bigger machine.
 
@@ -70,7 +138,7 @@ One container (about 375 MB) serves the game page and the game server on port 25
 
 ### Deploy to Akash
 
-The game runs on [Akash](https://akash.network) at https://battle.sparkdream.io, deployed with [deploy.yaml](deploy.yaml): 1 CPU, 1 GB of memory, and a 1 GB persistent volume for the leaderboard. Each release is a version `vX.Y.Z` used for the git tag, the image tag and `version` in `package.json`.
+The game runs on [Akash](https://akash.network) at https://battle.sparkdream.io, deployed with [deploy.yaml](deploy.yaml): 1 CPU, 1 GB of memory, and a 1 GB persistent volume for the profile database. Each release is a version `vX.Y.Z` used for the git tag, the image tag and `version` in `package.json`.
 
 ```bash
 # Bump "version" in package.json and the image tag in deploy.yaml, commit, then:
@@ -85,11 +153,11 @@ akash tx deployment create deploy.yaml --from <key> --chain-id akashnet-2 --node
 
 The Spark Dream launcher can deploy it too: in a services fleet (or a chain fleet), **+ add component… → Battle royale**, with the domain. The launcher pins the image tag in its profiles (`BATTLE_IMAGE` in `packages/launch-spec/src/profiles.ts`); bump it there when you release.
 
-To release a new version, push the new image and update the existing deployment with the new tag (Console: Update; CLI: `akash tx deployment update deploy.yaml ...`). An update keeps the lease and the leaderboard. Always use a new tag: providers cache images, so a reused tag may not update.
+To release a new version, push the new image and update the existing deployment with the new tag (Console: Update; CLI: `akash tx deployment update deploy.yaml ...`). An update keeps the lease and the profile database. Always use a new tag: providers cache images, so a reused tag may not update.
 
 **HTTPS.** Akash providers serve plain HTTP on port 80. `battle.sparkdream.io` is a proxied Cloudflare CNAME to the lease's ingress hostname (`<id>.ingress.<provider>`), with SSL mode *Flexible*, like the other services. Cloudflare passes WebSockets through, and the client connects to the origin that served the page, so the image has no domain built in. Recreating the deployment (rather than updating it) gives a new ingress hostname: update the CNAME.
 
-**Leaderboard.** It lives on the persistent volume, which survives restarts and updates but not closing the lease or moving to another provider. Copy `/app/data/leaderboard.json` out first (Console's shell, or `provider-services lease-shell`) if you want to keep it.
+**Profile database.** It lives on the persistent volume, which survives restarts and updates but not closing the lease or moving to another provider. Copy `/app/data/game.db` out first (Console's shell, or `provider-services lease-shell`) if you want to keep it; with the server stopped, or copy `game.db-wal` too.
 
 ## The game
 
@@ -101,7 +169,10 @@ To release a new version, push the new image and update the existing deployment 
 - **Feedback:** a crosshair, hit markers and floating damage numbers when your shots land, muzzle flashes, a camera shake when you're hit, death bursts, a landing effect, and synthesized sound.
 - **After you're eliminated:** you see your place, kills, damage and survival time. You can spectate (switching between living players) or hit "Play again". The end of a match shows the winner and a kill leaderboard. Lifetime stats are kept in your browser and shown on the menu.
 - **Spectating:** press Spectate on the start menu to only watch: you follow players (click or Space for the next one), the plane during the drop, and aren't counted as a player or take a bot's place. A spectator on their own still gets a bots-only match to watch. Switch between playing and spectating with "Just spectate" in the Esc menu (not while you're alive in a match).
-- **Leaderboard:** the server keeps every named human player's wins, kills, matches and best place (by name, case-insensitive; no accounts), ranked by wins then kills. Open it from the start menu or the Esc menu. Bots and players who left the name blank aren't on it.
+- **Guest profiles:** on its first visit the browser makes a secret token (localStorage) and the server keeps a profile under it: no sign-up. A name belongs to the first profile that takes it (case-insensitive), so nobody can play under yours; asking for a taken name keeps your current one, with a notice. Clearing site data loses the profile.
+- **Leaderboard:** every named profile's wins, kills, matches and best place, ranked by wins then kills. Open it from the start menu or the Esc menu. Bots and players who left the name blank aren't on it.
+- **Achievements:** milestones (first match, first elimination, first win, 5 or 10 eliminations in a match, surviving 4 minutes, picking up every special weapon, 100 items, 25 crates, 100 eliminations, 25 matches, 10 wins; [shared/src/achievements.ts](shared/src/achievements.ts)) are recorded per profile with a notice when earned. With a linked wallet they're also minted as badges (see "Web3").
+- **Funnel:** a `?ref=` in the URL on a browser's first visit is stored with its profile. `GET /admin/funnel` (needs `ADMIN_TOKEN`) reports profiles, players who finished a match, returning players (2+ days), 7-day actives, the same by ref, and humans per match.
 - **Reconnection:** if your connection drops, you have 20 seconds to get back into the same match. The client retries automatically, and refreshing the page rejoins too.
 
 ## Layout
@@ -139,5 +210,10 @@ Bots carry a `[bot]` tag. Every player gets their own color (unique until there 
 
 - Bots steer locally rather than planning a path, so they can get briefly stuck in building corners (they detect it and pick a new destination).
 - Automatic reconnection only kicks in once a connection has been up for 5 seconds (an SDK rule). A drop in the first few seconds of joining sends you back to the menu.
-- The leaderboard trusts names: anyone can play under someone else's name.
-- Map generation is random per room. There's no seeding or hand-made map yet.
+- Profiles live in one browser: there's no way yet to move one to another device or recover it after clearing site data.
+- The old `data/leaderboard.json` isn't imported: results start over in `data/game.db`.
+- Node prints an `ExperimentalWarning` for `node:sqlite` at startup; it's harmless.
+- Map generation is seeded per room (the same seed reproduces a layout; winners get the seed onchain), but there are no hand-made maps yet.
+- Onchain match writes trust the game server (it signs everything). Forging results would require the relayer key. Match records are served by the same server; the onchain hash proves a record wasn't changed after the match, not that it was true.
+- A match's chain writes go out in chunks of 8 messages (one tx each); if a later chunk fails, the earlier ones stay and nothing is retried. The match token goes first, so a career's `last_match` always exists; what can be missing is a badge or the map token.
+- A profile and a wallet aren't linked to each other: a wallet's onchain career starts from its first linked match, and badges follow that career, not the profile's achievements.

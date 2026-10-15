@@ -8,7 +8,7 @@ import {
 
 // An empty map and no bots, so a client can walk straight to loot.
 Object.assign(process.env, {
-  LEADERBOARD_FILE: "",
+  DB_FILE: "",
   LOBBY_SECONDS: "1", DROP_SECONDS: "1", BOT_FILL: "0", OBSTACLE_COUNT: "0", BUILDING_COUNT: "0",
   POND_COUNT: "0", BUSH_COUNT: "0", CRATE_COUNT: "0", LOOT_COUNT: "60",
 });

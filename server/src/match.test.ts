@@ -1,15 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { Funnel } from "./profiles";
 import { Client, type Room } from "@colyseus/sdk";
 import {
-  ERR_SERVER_FULL, GameState, LEADERBOARD_PATH, type LeaderboardEntry, MSG_INPUT, MSG_KILL, MSG_MATCH_END, MSG_NOTICE, MSG_SETTINGS, MSG_SPECTATE, MSG_STATS, type MatchEndMessage, PHASE_DROP,
+  ERR_SERVER_FULL, GameState, LEADERBOARD_PATH, type LeaderboardEntry, MATCH_RECORD_PATH, type MatchRecord, MSG_INPUT, MSG_KILL, MSG_MATCH_END, MSG_NOTICE, MSG_SETTINGS, MSG_SPECTATE, MSG_STATS, type MatchEndMessage, PHASE_DROP,
   PHASE_ENDED, PHASE_LOBBY, PHASE_PLAYING, type SpectateMessage, type StatsMessage, WEAPON_PISTOL,
 } from "@br/shared";
 
 // A fast match: short lobby and drop, zone at 10x speed. Env must be set
 // before the room module loads, since it reads these at import time.
-// LEADERBOARD_FILE="": keep the leaderboard in memory.
+// DB_FILE="": keep profiles and the leaderboard in memory. ADMIN_TOKEN turns on the funnel route.
 Object.assign(process.env, {
-  LOBBY_SECONDS: "2", DROP_SECONDS: "2", MATCH_SPEED: "10", BOT_FILL: "8", LEADERBOARD_FILE: "", MAX_ROOMS: "3",
+  LOBBY_SECONDS: "2", DROP_SECONDS: "2", MATCH_SPEED: "10", BOT_FILL: "8", DB_FILE: "", MAX_ROOMS: "3", ADMIN_TOKEN: "secret",
 });
 const PORT = 25670 + Math.floor(Math.random() * 1000);
 
@@ -26,6 +27,9 @@ afterAll(async () => {
   await server?.gracefullyShutdown(false);
 });
 
+/** A guest-profile token, as a browser would generate. */
+const token = (c: string) => c.repeat(64);
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function until(check: () => boolean, timeoutMs: number) {
@@ -39,7 +43,7 @@ async function until(check: () => boolean, timeoutMs: number) {
 describe("a full match against bots", () => {
   it("runs lobby → drop → playing → ended → lobby", { timeout: 120_000 }, async () => {
     const room: Room<any, GameState> = await new Client(`http://localhost:${PORT}`)
-      .joinOrCreate("battle", { name: "Tester", difficulty: "hard" }, GameState);
+      .joinOrCreate("battle", { name: "Tester", difficulty: "hard", profile: token("1"), ref: "x" }, GameState);
     const phases: string[] = [];
     let sawPartialView = false;
     let botsArmed = false;
@@ -82,7 +86,54 @@ describe("a full match against bots", () => {
     // Only the named human is on the server's leaderboard.
     const board = await (await fetch(`http://localhost:${PORT}${LEADERBOARD_PATH}`)).json() as LeaderboardEntry[];
     expect(board).toEqual([expect.objectContaining({ name: "Tester", matches: 1, bestPlace: stats!.place })]);
+
+    // The match record is served verbatim, with everyone's result in it.
+    expect(end!.matchId).toMatch(/^[0-9a-f]{16}$/);
+    const recordUrl = `http://localhost:${PORT}${MATCH_RECORD_PATH}/${end!.matchId}`;
+    const record = await (await fetch(recordUrl)).json() as MatchRecord;
+    expect(record).toEqual(expect.objectContaining({ id: end!.matchId, game: "battle-royale", humans: 1, winner: end!.winner }));
+    expect(record.players.map((p) => p.place)).toEqual([...record.players.map((p) => p.place)].sort((a, b) => a - b));
+    expect(record.players).toContainEqual(expect.objectContaining({ name: "Tester", bot: false, place: stats!.place }));
+    expect(record.players.some((p) => p.bot)).toBe(true);
+    expect((await fetch(`http://localhost:${PORT}${MATCH_RECORD_PATH}/ffffffffffffffff`)).status).toBe(404);
+
+    // The funnel counts them under their ref, and only for the operator.
+    const funnelUrl = `http://localhost:${PORT}/admin/funnel`;
+    expect((await fetch(funnelUrl)).status).toBe(401);
+    const funnel = await (await fetch(funnelUrl, { headers: { Authorization: "Bearer secret" } })).json() as Funnel;
+    expect(funnel).toEqual(expect.objectContaining({ played: 1, matches7d: 1, humansPerMatch7d: 1 }));
+    expect(funnel.byRef).toContainEqual({ ref: "x", profiles: 1, played: 1, returning: 0 });
     await room.leave();
+  });
+});
+
+describe("guest profiles", () => {
+  it("reserves a name for the profile that took it", { timeout: 15_000 }, async () => {
+    const client = new Client(`http://localhost:${PORT}`);
+    const owner: Room<any, GameState> = await client.joinOrCreate("battle", { name: "Phoenix", profile: token("2") }, GameState);
+    owner.onMessage("*", () => {});
+    await until(() => owner.state.players.get(owner.sessionId) !== undefined, 5000);
+    expect(owner.state.players.get(owner.sessionId)!.name).toBe("Phoenix");
+
+    // Someone else (with or without a profile) can't use it, in any spelling.
+    for (const profile of [token("3"), undefined]) {
+      const notices: string[] = [];
+      const other: Room<any, GameState> = await client.joinOrCreate("battle", { name: "phoenix", profile }, GameState);
+      other.onMessage(MSG_NOTICE, (m: string) => notices.push(m));
+      other.onMessage("*", () => {});
+      await until(() => other.state.players.get(other.sessionId) !== undefined && notices.length > 0, 5000);
+      expect(notices[0]).toBe("The name phoenix is taken");
+      expect(other.state.players.get(other.sessionId)!.name).toMatch(/^Player \d+$/);
+      await other.leave();
+    }
+
+    // The owner gets it back next time even without typing it.
+    await owner.leave();
+    const back: Room<any, GameState> = await client.joinOrCreate("battle", { profile: token("2") }, GameState);
+    back.onMessage("*", () => {});
+    await until(() => back.state.players.get(back.sessionId) !== undefined, 5000);
+    expect(back.state.players.get(back.sessionId)!.name).toBe("Phoenix");
+    await back.leave();
   });
 });
 

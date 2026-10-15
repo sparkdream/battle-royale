@@ -1,0 +1,21 @@
+// Syncthing ignore patterns for battle-royale (npm workspaces)
+// Keep identical on every peer. .git is synced, like the other sparkdream folders.
+
+// Dependencies, ~240 MB. Reinstall per machine with `npm ci`.
+node_modules
+
+// Build output (client/dist), regenerate with npm run build
+dist
+*.tsbuildinfo
+
+// Live SQLite profile database (game.db + -wal + -shm). Syncing an open DB corrupts it.
+/data
+
+// Secrets
+.env
+
+// Noise
+*.log
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,14 +1,18 @@
 import Phaser from "phaser";
 import { Client, type Room } from "@colyseus/sdk";
 import {
-  DIFFICULTIES, type Difficulty, ERR_SERVER_FULL, GameState, type JoinOptions, LEADERBOARD_PATH, type LeaderboardEntry, MSG_SETTINGS,
-  PHASE_DROP, PHASE_LOBBY, PHASE_PLAYING, type SettingsMessage,
+  ACHIEVEMENTS, careerFromAttributes, DIFFICULTIES, type Difficulty, ERR_SERVER_FULL, GameState,
+  type JoinOptions, LEADERBOARD_PATH, type LeaderboardEntry, MSG_SETTINGS,
+  PHASE_DROP, PHASE_LOBBY, PHASE_PLAYING, PROFILE_TOKEN_PATTERN, type SettingsMessage, shortAddress,
 } from "@br/shared";
 import { Sfx } from "./audio";
 import { describeCareer, loadCareer } from "./career";
 import { GameScene } from "./GameScene";
 import { Hud } from "./hud";
 import { TouchControls, isTouchDevice } from "./touch";
+import {
+  chainStatus, connectKeplr, fetchMyTokens, keplrAvailable, loadChainStatus, proveAddress, type WalletKey,
+} from "./wallet";
 
 // In dev the Vite server and the game server run on different ports. In
 // production the game server serves this page, so it's the same origin.
@@ -37,6 +41,24 @@ const storage = {
 /** Lets a page refresh rejoin the same match (the server holds the seat briefly). */
 const RECONNECT_KEY = "reconnect";
 
+/**
+ * This browser's secret guest-profile token: the server keeps results, the
+ * reserved name and achievements under it. Without storage it lasts the page.
+ */
+function profileToken(): string {
+  const saved = storage.get(localStorage, "profile");
+  if (PROFILE_TOKEN_PATTERN.test(saved)) return saved;
+  const token = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+  storage.set(localStorage, "profile", token);
+  return token;
+}
+const profile = profileToken();
+
+// Where this browser first came from (`?ref=x`); the first one sticks.
+const urlRef = new URLSearchParams(location.search).get("ref") ?? "";
+if (urlRef && !storage.get(localStorage, "ref")) storage.set(localStorage, "ref", urlRef);
+const ref = storage.get(localStorage, "ref") || urlRef;
+
 const menu = document.getElementById("menu") as HTMLFormElement;
 const nameInput = document.getElementById("name") as HTMLInputElement;
 const difficultyInput = document.getElementById("difficulty") as HTMLSelectElement;
@@ -44,9 +66,16 @@ const career = document.getElementById("career")!;
 const menuError = document.getElementById("menu-error")!;
 const playButton = menu.querySelector("button")!;
 const spectateButton = document.getElementById("spectate-button") as HTMLButtonElement;
+const walletRow = document.getElementById("wallet-row")!;
+const connectButton = document.getElementById("connect-wallet") as HTMLButtonElement;
+const walletChip = document.getElementById("wallet-chip")!;
+const walletNote = document.getElementById("wallet-note")!;
 const board = document.getElementById("board")!;
 const boardRows = document.getElementById("board-rows")!;
 const boardStatus = document.getElementById("board-status")!;
+const boardWeb3 = document.getElementById("board-web3")!;
+const boardCareer = document.getElementById("board-career")!;
+const achvList = document.getElementById("achv-list")!;
 const pause = document.getElementById("pause") as HTMLFormElement;
 const pauseName = document.getElementById("pause-name") as HTMLInputElement;
 const pauseDifficulty = document.getElementById("pause-difficulty") as HTMLSelectElement;
@@ -68,6 +97,75 @@ nameInput.value = storage.get(localStorage, "name");
 const savedDifficulty = storage.get(localStorage, "difficulty");
 if ((DIFFICULTIES as readonly string[]).includes(savedDifficulty)) difficultyInput.value = savedDifficulty;
 career.textContent = describeCareer(loadCareer());
+
+// ---- Wallet (web3 mode) -------------------------------------------------
+// The server only learns the address from a ticket earned with a fresh
+// signature; an expired ticket just means name-keyed play.
+const ADDRESS_KEY = "web3-address";
+let wallet: WalletKey | null = null;
+let walletTicket: string | null = null;
+let walletProvedAt = 0;
+
+function setWalletChip(text: string, error = false) {
+  walletChip.hidden = false;
+  walletChip.textContent = text;
+  walletChip.classList.toggle("error", error);
+}
+
+async function connectWallet() {
+  if (!keplrAvailable()) {
+    walletNote.hidden = false;
+    walletNote.textContent = "Install the Keplr extension to play with onchain records.";
+    return;
+  }
+  connectButton.disabled = true;
+  try {
+    wallet = await connectKeplr();
+    storage.set(localStorage, ADDRESS_KEY, wallet.address);
+    walletNote.hidden = true;
+    walletTicket = await proveAddress(serverUrl, wallet);
+    const proved = walletTicket !== null;
+    walletProvedAt = proved ? Date.now() : 0;
+    setWalletChip(proved ? shortAddress(wallet.address) : `${shortAddress(wallet.address)} (not verified)`, !proved);
+    if (nameInput.value === "") nameInput.placeholder = "Name (optional)";
+  } catch (err) {
+    console.error(err);
+    setWalletChip("wallet error", true);
+  } finally {
+    connectButton.disabled = false;
+  }
+}
+
+/** A fresh-enough ticket for JoinOptions.ticket (re-signs after 10 minutes). */
+async function walletTicketFresh(): Promise<string | undefined> {
+  if (!wallet || !chainStatus()) return undefined;
+  if (walletTicket === null || Date.now() - walletProvedAt > 10 * 60_000) {
+    try {
+      walletTicket = await proveAddress(serverUrl, wallet);
+      if (walletTicket === null) return undefined;
+      walletProvedAt = Date.now();
+    } catch {
+      return undefined;
+    }
+  }
+  return walletTicket;
+}
+
+// Web3 mode exists on this server: show the connect affordance, and quietly
+// reconnect last time's wallet (the signature comes only when joining).
+void loadChainStatus(serverUrl).then((status) => {
+  if (!status) return;
+  walletRow.hidden = false;
+  const saved = storage.get(localStorage, ADDRESS_KEY);
+  if (saved && keplrAvailable()) {
+    void connectKeplr().then((key) => {
+      if (key.address !== saved) return;
+      wallet = key;
+      setWalletChip(shortAddress(key.address));
+    }).catch(() => {});
+  }
+});
+connectButton.addEventListener("click", () => void connectWallet());
 
 // The in-game menu: Esc (or the touch menu button) toggles it, and closing it applies the changes.
 let pauseOpened = { name: "", difficulty: "", spectate: false };
@@ -97,7 +195,7 @@ async function showBoard() {
   board.hidden = false;
   boardRows.replaceChildren();
   boardStatus.textContent = "Loading…";
-  let list: LeaderboardEntry[];
+  let list: (LeaderboardEntry & { address?: string; onchain?: boolean })[];
   try {
     const res = await fetch(`${serverUrl.replace(/\/$/, "")}${LEADERBOARD_PATH}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -110,17 +208,63 @@ async function showBoard() {
   boardStatus.textContent = list.length ? "" : "No results yet. Finish a match with a name to get on the board.";
   // In a game, our name may have changed since the start menu.
   const me = (room?.state.players.get(room.sessionId)?.name ?? nameInput.value).trim().toLowerCase();
+  const myAddress = wallet?.address ?? "";
   boardRows.replaceChildren(...list.map((e, i) => {
     const row = document.createElement("tr");
-    row.classList.toggle("me", !!me && e.name.toLowerCase() === me);
-    for (const [value, cls] of [[i + 1], [e.name, "name"], [e.wins], [e.kills], [e.matches], [`#${e.bestPlace}`]] as const) {
+    row.classList.toggle("me", (!!me && e.name.toLowerCase() === me) || (!!myAddress && e.address === myAddress));
+    for (const [value, cls] of [
+      [i + 1],
+      [e.onchain ? `${e.name} ⬛` : e.name, "name"],
+      [e.wins],
+      [e.kills],
+      [e.matches],
+      [`#${e.bestPlace}`],
+    ] as const) {
       const cell = document.createElement("td");
       cell.textContent = String(value);
       if (cls) cell.className = cls;
       row.append(cell);
     }
+    if (e.address) row.title = e.address;
     return row;
   }));
+  void showOnchainCareer();
+}
+
+/** Badges, career stats and map tokens for the connected wallet, all read from the chain. */
+async function showOnchainCareer() {
+  boardWeb3.hidden = true;
+  if (!wallet || !chainStatus()) return;
+  let tokens;
+  try {
+    tokens = await fetchMyTokens(serverUrl, wallet.address);
+  } catch {
+    return;
+  }
+  if (!tokens.length) {
+    boardCareer.textContent = "No onchain record yet — finish a match to write one.";
+    achvList.replaceChildren();
+    boardWeb3.hidden = false;
+    return;
+  }
+  const careerToken = tokens.find((t) => t.attributes.some((a) => a.key === "matches"));
+  const badgeTokens = tokens.filter((t) => t.attributes.some((a) => a.key === "achievement"));
+  const mapTokens = tokens.filter((t) => t.attributes.some((a) => a.key === "map"));
+  if (careerToken) {
+    const stats = careerFromAttributes(careerToken.attributes);
+    boardCareer.textContent =
+      `${stats.matches} matches · ${stats.wins} wins · ${stats.kills} kills · ${stats.crates} crates · ${mapTokens.length} map tokens`;
+    achvList.replaceChildren(...ACHIEVEMENTS.map((def) => {
+      const owned = badgeTokens.some((t) => t.attributes.find((a) => a.key === "achievement")?.value === def.code);
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.classList.toggle("locked", !owned);
+      badge.textContent = owned ? `🏅 ${def.title}` : def.title;
+      badge.title = def.description;
+      return badge;
+    }));
+  }
+  boardWeb3.hidden = false;
 }
 
 function openPause() {
@@ -209,8 +353,9 @@ if (token) {
 
 /** Join the busiest room for this difficulty, or with `fresh`, start a room of our own. */
 async function joinNew(fresh = false) {
+  const ticket = await walletTicketFresh();
   const options: JoinOptions = {
-    name: nameInput.value.trim(), difficulty: difficultyInput.value as Difficulty, spectate: spectating,
+    name: nameInput.value.trim(), difficulty: difficultyInput.value as Difficulty, spectate: spectating, profile, ref, ticket,
   };
   const join = () => client.joinOrCreate("battle", options, GameState);
   if (!fresh) return join();

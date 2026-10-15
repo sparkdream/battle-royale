@@ -5,16 +5,18 @@ import {
   type InputMessage, KEY_DOWN, KEY_HEAL, KEY_INTERACT, KEY_JUMP, KEY_LEFT, KEY_RELOAD, KEY_RIGHT,
   KEY_UP, type KillMessage, LOOT_AMMO, LOOT_ARMOR, LOOT_MEDKIT, type Loot, MAP_SIZE, MAX_HEALTH,
   MEDKIT_TICKS, MSG_HIT, MSG_INPUT, MSG_KILL, MSG_LATENCY, MSG_MATCH_END, MSG_SPECTATE,
-  MSG_NOTICE, MSG_SPECTATE_NEXT, MSG_STATS, type MapGeometry, type MatchEndMessage, PHASE_DROP, PHASE_ENDED,
+  MSG_NOTICE, MSG_SPECTATE_NEXT, MSG_STATS, MSG_WEB3, type MapGeometry, type MatchEndMessage, PHASE_DROP, PHASE_ENDED,
   PHASE_LOBBY, PHASE_PLAYING, PICKUP_RADIUS, PLAYER_COLORS, PLAYER_RADIUS, type Player,
   type SpectateMessage, type StatsMessage, TICK_MS, WEAPONS, WEAPON_NONE, emptyGeometry,
   firstSolidHit, inCircles, inRects, isWeaponLoot, magIn, reserveIn, stepPlayer, weaponIn,
+  type Web3Notice,
 } from "@br/shared";
 import type { Sfx } from "./audio";
 import { recordMatch } from "./career";
 import type { Hud } from "./hud";
 import { Minimap } from "./minimap";
 import type { TouchControls } from "./touch";
+import { explorerTxUrl } from "./wallet";
 
 const MAX_CATCHUP_STEPS = 5;
 // Reconciliation errors bigger than this are teleports: snap, don't smooth.
@@ -160,6 +162,7 @@ export class GameScene extends Phaser.Scene {
     this.room.onMessage(MSG_STATS, live((msg: StatsMessage) => this.onStats(msg)));
     this.room.onMessage(MSG_SPECTATE, live((msg: SpectateMessage) => this.onSpectate(msg)));
     this.room.onMessage(MSG_MATCH_END, live((msg: MatchEndMessage) => this.onMatchEnd(msg)));
+    this.room.onMessage(MSG_WEB3, live((msg: Web3Notice) => this.hud.web3Save(msg, explorerTxUrl(msg.txHashes[0] ?? ""))));
     this.room.onDrop(live(() => this.hud.showBanner({ title: "Connection lost", sub: "Reconnecting…" })));
     this.room.onReconnect(live(() => this.hud.hideBanner()));
     this.room.onLeave(live(() => this.hud.showBanner({ title: "Disconnected", playAgain: true })));

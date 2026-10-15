@@ -1,4 +1,4 @@
-import type { KillMessage, MatchEndMessage, StatsMessage } from "@br/shared";
+import { achievementByCode, type KillMessage, type MatchEndMessage, type StatsMessage, type Web3Notice } from "@br/shared";
 
 const FEED_MS = 5000;
 const FEED_MAX = 5;
@@ -38,6 +38,7 @@ export class Hud {
   private bannerStats = el("banner-stats");
   private bannerBoard = el("banner-board");
   private bannerHint = el("banner-hint");
+  private bannerWeb3 = el("banner-web3");
   private playAgain = el<HTMLButtonElement>("play-again");
   private cache = new Map<string, unknown>();
 
@@ -56,6 +57,7 @@ export class Hud {
     this.cache.clear();
     this.feed.replaceChildren();
     this.hideBanner();
+    this.bannerWeb3.hidden = true;
     this.setPrompt("");
     this.setAction("", 0);
     this.setStatus("", false);
@@ -126,6 +128,34 @@ export class Hud {
     const row = document.createElement("div");
     row.textContent = text;
     this.pushFeed(row);
+  }
+
+  /**
+   * The onchain write for this player's match landed: confirmations in the
+   * feed (always) and a summary line on the end banner if it's still up.
+   * `txUrl` links the first tx when the chain's explorer is known.
+   */
+  web3Save(notice: Web3Notice, txUrl: string | null) {
+    const parts = ["Career saved onchain"];
+    // The server already announced the achievements themselves; this is their badges.
+    for (const code of notice.newAchievements) parts.push(`Badge minted: ${achievementByCode(code)?.title ?? code}`);
+    if (notice.mapToken) parts.push("Map champion token minted");
+    if (notice.matchId) parts.push(`Match ${notice.matchId} recorded`);
+    for (const text of parts) this.notice(`⬛ ${text}`);
+
+    this.bannerWeb3.replaceChildren();
+    const line = document.createElement("div");
+    line.textContent = parts.join(" · ");
+    this.bannerWeb3.append(line);
+    if (txUrl) {
+      const link = document.createElement("a");
+      link.href = txUrl;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = "view onchain";
+      this.bannerWeb3.append(link);
+    }
+    this.bannerWeb3.hidden = false;
   }
 
   kill({ killer, victim, weapon }: KillMessage) {

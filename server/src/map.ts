@@ -21,6 +21,9 @@ export interface GeneratedMap {
   crates: CrateRect[];
   /** The crate layout as generated, for restoring between matches. */
   initialCrates: readonly CrateRect[];
+  /** The layout's seed and stable id (mapIdOf) — what map tokens point at. */
+  seed: number;
+  id: string;
 }
 
 /** Bring back every crate (at full health) for a new match. */
@@ -31,8 +34,41 @@ export function resetCrates(state: GameState, map: GeneratedMap) {
   for (const c of map.initialCrates) state.crates.set(c.id, new Crate({ x: c.x, y: c.y }));
 }
 
+/** A fresh 32-bit seed for a room's layout. */
+export function randomSeed(): number {
+  return Math.floor(Math.random() * 0x100000000) >>> 0;
+}
+
+/**
+ * mulberry32: small, fast, good enough for terrain, and — unlike Math.random —
+ * the same seed lays out the same map, so a seed plus the counts below
+ * regenerates a layout exactly (what map tokens point at).
+ */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** FNV-1a over seed+counts: the short stable id a map token carries. */
+export function mapIdOf(seed: number, counts: MapCounts): string {
+  const parts = `${seed}:${counts.buildings}:${counts.rocks}:${counts.ponds}:${counts.bushes}:${counts.crates}`;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < parts.length; i++) {
+    hash ^= parts.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 /** Fill the state with terrain; returns the geometry for collision and vision. */
-export function generateMap(state: GameState, counts: MapCounts, nextId: () => string): GeneratedMap {
+export function generateMap(
+  state: GameState, counts: MapCounts, nextId: () => string, seed = randomSeed(), rng = mulberry32(seed),
+): GeneratedMap {
   const buildings: Rect[] = [];
   const walls: Rect[] = [];
   const ponds: Circle[] = [];
@@ -44,27 +80,28 @@ export function generateMap(state: GameState, counts: MapCounts, nextId: () => s
     buildings.some((b) => rectsOverlap(b, { x: x - r, y: y - r, w: r * 2, h: r * 2 }, margin));
   const nearCircle = (list: Circle[], x: number, y: number, r: number, margin: number) =>
     list.some((o) => (o.x - x) ** 2 + (o.y - y) ** 2 < (o.r + r + margin) ** 2);
+  const rand = (min: number, span: number) => min + rng() * span;
 
   for (let attempt = 0; buildings.length < counts.buildings && attempt < counts.buildings * 50; attempt++) {
-    const w = snap(260 + Math.random() * 180);
-    const h = snap(220 + Math.random() * 160);
-    const b = { x: snap(150 + Math.random() * (MAP_SIZE - 300 - w)), y: snap(150 + Math.random() * (MAP_SIZE - 300 - h)), w, h };
+    const w = snap(rand(260, 180));
+    const h = snap(rand(220, 160));
+    const b = { x: snap(rand(150, MAP_SIZE - 300 - w)), y: snap(rand(150, MAP_SIZE - 300 - h)), w, h };
     if (buildings.some((o) => rectsOverlap(o, b, 160))) continue;
     buildings.push(b);
-    walls.push(...buildingWalls(b));
+    walls.push(...buildingWalls(b, rng));
   }
 
   scatter(counts.ponds, () => {
-    const r = Math.round(90 + Math.random() * 90);
-    const { x, y } = randomPoint(r);
+    const r = Math.round(rand(90, 90));
+    const { x, y } = randomPoint(r, rng);
     if (nearBuilding(x, y, r, 80) || nearCircle(ponds, x, y, r, 200)) return false;
     ponds.push({ x, y, r });
     return true;
   });
 
   scatter(counts.rocks, () => {
-    const r = Math.round(22 + Math.random() * 48);
-    const { x, y } = randomPoint(r);
+    const r = Math.round(rand(22, 48));
+    const { x, y } = randomPoint(r, rng);
     // Leave room to walk between rocks, and keep them off buildings and ponds.
     if (nearCircle(rocks, x, y, r, PLAYER_RADIUS * 3) || nearCircle(ponds, x, y, r, 20)) return false;
     if (nearBuilding(x, y, r, PLAYER_RADIUS * 3)) return false;
@@ -73,8 +110,8 @@ export function generateMap(state: GameState, counts: MapCounts, nextId: () => s
   });
 
   scatter(counts.bushes, () => {
-    const r = Math.round(30 + Math.random() * 14);
-    const { x, y } = randomPoint(r);
+    const r = Math.round(rand(30, 14));
+    const { x, y } = randomPoint(r, rng);
     if (nearCircle(rocks, x, y, r, 10) || nearCircle(ponds, x, y, r, 10) || nearCircle(bushes, x, y, r, 40)) return false;
     if (nearBuilding(x, y, r, 20)) return false;
     bushes.push({ x, y, r });
@@ -96,9 +133,12 @@ export function generateMap(state: GameState, counts: MapCounts, nextId: () => s
     return true;
   };
   for (const b of buildings) {
-    if (Math.random() < 0.7) placeCrate(b.x + WALL + 30 + Math.random() * (b.w - CRATE_SIZE - WALL * 2 - 60), b.y + WALL + 30 + Math.random() * (b.h - CRATE_SIZE - WALL * 2 - 60));
+    if (rng() < 0.7) placeCrate(
+      b.x + WALL + 30 + rng() * (b.w - CRATE_SIZE - WALL * 2 - 60),
+      b.y + WALL + 30 + rng() * (b.h - CRATE_SIZE - WALL * 2 - 60),
+    );
   }
-  scatter(counts.crates, () => placeCrate(80 + Math.random() * (MAP_SIZE - 160), 80 + Math.random() * (MAP_SIZE - 160)));
+  scatter(counts.crates, () => placeCrate(rand(80, MAP_SIZE - 160), rand(80, MAP_SIZE - 160)));
 
   for (const b of buildings) state.floors.push(new Box(b));
   for (const w of walls) state.walls.push(new Box(w));
@@ -106,13 +146,13 @@ export function generateMap(state: GameState, counts: MapCounts, nextId: () => s
   for (const p of ponds) state.ponds.push(new Disc(p));
   for (const b of bushes) state.bushes.push(new Disc(b));
 
-  return { geo, crates, initialCrates: [...crates] };
+  return { geo, crates, initialCrates: [...crates], seed, id: mapIdOf(seed, counts) };
 }
 
 /** Four walls with a doorway in two or three of them. */
-function buildingWalls(b: Rect): Rect[] {
+function buildingWalls(b: Rect, rng: () => number = Math.random): Rect[] {
   const sides = ["top", "bottom", "left", "right"] as const;
-  const doors = new Set(shuffle([...sides]).slice(0, Math.random() < 0.5 ? 2 : 3));
+  const doors = new Set(shuffle([...sides], rng).slice(0, rng() < 0.5 ? 2 : 3));
   const out: Rect[] = [];
   for (const side of sides) {
     const horizontal = side === "top" || side === "bottom";
@@ -121,7 +161,7 @@ function buildingWalls(b: Rect): Rect[] {
     const y = side === "bottom" ? b.y + b.h - WALL : b.y;
     const segments: [number, number][] = [];
     if (doors.has(side)) {
-      const at = snap(WALL + 30 + Math.random() * (length - DOOR - WALL * 2 - 60));
+      const at = snap(WALL + 30 + rng() * (length - DOOR - WALL * 2 - 60));
       segments.push([0, at], [at + DOOR, length]);
     } else {
       segments.push([0, length]);
@@ -181,10 +221,10 @@ function scatter(count: number, tryPlace: () => boolean) {
   }
 }
 
-function randomPoint(margin: number) {
+function randomPoint(margin: number, rng: () => number = Math.random) {
   return {
-    x: Math.round(margin + Math.random() * (MAP_SIZE - margin * 2)),
-    y: Math.round(margin + Math.random() * (MAP_SIZE - margin * 2)),
+    x: Math.round(margin + rng() * (MAP_SIZE - margin * 2)),
+    y: Math.round(margin + rng() * (MAP_SIZE - margin * 2)),
   };
 }
 
@@ -196,9 +236,9 @@ function snap(v: number) {
   return Math.round(v / 10) * 10;
 }
 
-function shuffle<T>(items: T[]): T[] {
+function shuffle<T>(items: T[], rng: () => number = Math.random): T[] {
   for (let i = items.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(rng() * (i + 1));
     [items[i], items[j]] = [items[j], items[i]];
   }
   return items;

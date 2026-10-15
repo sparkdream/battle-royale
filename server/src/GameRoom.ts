@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { type Client, Room, ServerError } from "@colyseus/core";
 import { StateView } from "@colyseus/schema";
 import {
@@ -6,17 +7,19 @@ import {
   KEY_HEAL, KEY_INTERACT, KEY_JUMP, KEY_MASK, KEY_RELOAD, type KillMessage, LAG_COMP_MAX_MS,
   LOBBY_SECONDS, LOOT_AMMO, LOOT_ARMOR, LOOT_MEDKIT, MAP_SIZE, MAX_ARMOR, MAX_HEALTH, MAX_MEDKITS,
   MAX_PLAYERS, MEDKIT_HEAL, MEDKIT_TICKS, MIN_PLAYERS_TO_START, MSG_HIT, MSG_INPUT, MSG_KILL,
-  MSG_LATENCY, MSG_MATCH_END, MSG_NOTICE, MSG_SETTINGS, MSG_SPECTATE, MSG_SPECTATE_NEXT, MSG_STATS, MUZZLE_OFFSET,
-  type MatchEndMessage, PHASE_DROP, PHASE_ENDED, PHASE_LOBBY, PHASE_PLAYING, PICKUP_RADIUS,
+  MSG_LATENCY, MSG_MATCH_END, MSG_NOTICE, MSG_SETTINGS, MSG_SPECTATE, MSG_SPECTATE_NEXT, MSG_STATS, MSG_WEB3, MUZZLE_OFFSET,
+  type MatchEndMessage, type MatchEntry, type MatchParticipant, type MatchRecord, PHASE_DROP, PHASE_ENDED, PHASE_LOBBY, PHASE_PLAYING, PICKUP_RADIUS,
   PLAYER_COLORS, PLAYER_RADIUS, Player, RECONNECT_SECONDS, type SettingsMessage, type SpectateMessage, type StatsMessage,
   TICK_DT, TICK_MS, TICK_RATE, WEAPONS, WEAPON_NONE, WEAPON_PISTOL, type Weapon, activeWeapon,
   ammoPickupAmount, ammoTarget, canSee, circleBlocked, giveWeapon, isWeaponLoot, magIn, maxReserve,
   raycastSolid, reserveIn, resetInventory, segmentCircleHit, setMag, setReserve, setSlotContents,
-  stepPlayer, weaponIn,
+  shortAddress, stepPlayer, weaponIn,
 } from "@br/shared";
 import { Bot, type BotWorld, SKILL, botName, randomPersonality } from "./Bot";
-import { leaderboard } from "./leaderboard";
-import { type GeneratedMap, dropLoot, generateMap, randomLootType, resetCrates, spawnLoot } from "./map";
+import { web3 } from "./chain";
+import { addressAuth } from "./instance";
+import { type MatchResult, profiles } from "./profiles";
+import { type GeneratedMap, dropLoot, generateMap, randomLootType, randomSeed, resetCrates, spawnLoot } from "./map";
 import { ZoneController } from "./ZoneController";
 
 // Inputs applied per player per tick. Lets a client that stalled catch up a
@@ -71,8 +74,14 @@ interface PlayerMeta {
   watchId: string;
   /** Players currently in this client's StateView. */
   visible: Set<string>;
-  /** A human who picked a name, so their results go on the leaderboard. */
-  ranked: boolean;
+  /** The human's guest profile, where their results are recorded. "" for bots and players without one. */
+  profileId: string;
+  /** Spark Dream address proven at join; results are also recorded onchain against it. */
+  address?: string;
+  /** Loot types picked up this match. */
+  collected: Map<number, number>;
+  /** Crates broken this match. */
+  crates: number;
 }
 
 interface BulletSim {
@@ -103,6 +112,16 @@ export class GameRoom extends Room<{ state: GameState }> {
   private bots = new Map<string, Bot>();
   private botsCreated = 0;
   private botWorld!: BotWorld;
+  /** Who started the current match, for the funnel's humans-per-match count. */
+  private matchHumans = 0;
+  private matchBots = 0;
+  /** Linked players' results this match, recorded onchain when it ends. */
+  private matchEntries: MatchEntry[] = [];
+  /** Everyone's result this match (bots too), in elimination order: the match record. */
+  private matchLog: MatchParticipant[] = [];
+  private matchId = "";
+  private matchStartedAt = 0;
+  private offNotice: () => void = () => {};
 
   onCreate(options?: JoinOptions) {
     // Rejects the create; joinOrCreate only creates when every room is full.
@@ -112,12 +131,24 @@ export class GameRoom extends Room<{ state: GameState }> {
     this.difficulty = requested && DIFFICULTIES.includes(requested) ? requested : "normal";
     this.setState(new GameState());
     this.state.difficulty = this.difficulty;
-    this.map = generateMap(this.state, MAP_COUNTS, () => this.newId());
+    this.map = generateMap(this.state, MAP_COUNTS, () => this.newId(), randomSeed());
     this.zone = new ZoneController(this.state.zone, MATCH_SPEED);
     this.botWorld = {
       tick: 0, phase: PHASE_LOBBY, players: this.state.players, loot: this.state.loot,
       geo: this.map.geo, zone: this.state.zone, plane: this.state.plane,
     };
+
+    // Onchain notices (post-match tx confirmations) go to whichever client
+    // here plays under that address.
+    this.offNotice = web3.onNotice((address, notice) => {
+      for (const client of this.clients) {
+        if (this.meta.get(client.sessionId)?.address === address) {
+          client.send(MSG_WEB3, notice);
+          return true;
+        }
+      }
+      return false;
+    });
 
     this.onMessage(MSG_INPUT, (client, msg: InputMessage) => this.queueInput(client, msg));
     this.onMessage(MSG_LATENCY, (client, ms: unknown) => {
@@ -134,11 +165,16 @@ export class GameRoom extends Room<{ state: GameState }> {
 
   onJoin(client: Client, options?: JoinOptions) {
     const player = new Player();
-    const name = sanitizeName(options?.name);
-    player.name = name || `Player ${this.clients.length}`;
+    const profile = profiles.profile(options?.profile, options?.ref);
+    // An address only comes from a ticket its owner earned by signing a login nonce just now.
+    const address = addressAuth.addressFor(options?.ticket);
+    const fallback = profile?.name || (address ? shortAddress(address) : `Player ${this.clients.length}`);
+    player.name = this.pickName(client, profile?.id ?? "", sanitizeName(options?.name), fallback);
     player.spectator = options?.spectate === true;
     this.addPlayer(client.sessionId, player);
-    this.meta.get(client.sessionId)!.ranked = !!name;
+    const meta = this.meta.get(client.sessionId)!;
+    meta.profileId = profile?.id ?? "";
+    meta.address = address;
     // Arrived mid-match: spectate until the next lobby.
     if (this.state.phase !== PHASE_LOBBY) player.alive = false;
     client.view = new StateView();
@@ -162,6 +198,7 @@ export class GameRoom extends Room<{ state: GameState }> {
   }
 
   onDispose() {
+    this.offNotice();
     roomCount--;
   }
 
@@ -170,6 +207,9 @@ export class GameRoom extends Room<{ state: GameState }> {
   private enterLobby() {
     this.state.phase = PHASE_LOBBY;
     this.phaseTicks = LOBBY_TICKS;
+    this.matchEntries = [];
+    this.matchLog = [];
+    this.matchId = "";
     this.zone.reset();
     this.clearBullets();
     this.state.loot.clear();
@@ -204,9 +244,16 @@ export class GameRoom extends Room<{ state: GameState }> {
     plane.y1 = cy + dy * half;
     plane.t = 0;
 
+    this.matchHumans = this.matchBots = 0;
+    this.matchId = randomBytes(8).toString("hex");
+    this.matchStartedAt = Math.floor(Date.now() / 1000);
+    this.matchEntries = [];
+    this.matchLog = [];
     this.state.players.forEach((p, id) => {
       this.resetPlayer(id, p);
       if (p.spectator) return;
+      if (p.bot) this.matchBots++;
+      else this.matchHumans++;
       p.inPlane = true;
       p.x = plane.x0;
       p.y = plane.y0;
@@ -226,6 +273,7 @@ export class GameRoom extends Room<{ state: GameState }> {
     this.phaseTicks = ENDED_SECONDS * TICK_RATE;
     const winner = winnerId ? this.state.players.get(winnerId) : undefined;
     if (winnerId && winner) this.sendStats(winnerId, winner, 1, "");
+    if (this.matchHumans > 0) profiles.recordMatch(this.matchHumans, this.matchBots);
 
     const leaderboard: MatchEndMessage["leaderboard"] = [];
     this.state.players.forEach((p) => {
@@ -234,7 +282,31 @@ export class GameRoom extends Room<{ state: GameState }> {
     leaderboard.sort((a, b) => b.kills - a.kills);
     this.broadcast(MSG_MATCH_END, {
       winner: winner?.name ?? "", winnerId: winnerId ?? "", leaderboard: leaderboard.slice(0, 5),
+      matchId: this.matchHumans > 0 ? this.matchId : "",
     } satisfies MatchEndMessage);
+
+    // The match record: kept for GET /matches/<id>, and anchored onchain by a
+    // match token's uri hash when anyone in the match linked a wallet.
+    const record: MatchRecord = {
+      id: this.matchId,
+      game: "battle-royale",
+      map: { id: this.map.id, seed: this.map.seed },
+      difficulty: this.difficulty,
+      startedAt: this.matchStartedAt,
+      endedAt: Math.floor(Date.now() / 1000),
+      humans: this.matchHumans,
+      bots: this.matchBots,
+      winner: winner?.name ?? "",
+      players: [...this.matchLog].sort((a, b) => a.place - b.place),
+    };
+    if (this.matchHumans > 0) profiles.storeMatch(record);
+
+    // Onchain: careers, badges, the winner's map token and the match token
+    // (when enabled and anyone in the match linked a wallet). Notices flow back via MSG_WEB3.
+    if (web3.enabled && this.matchEntries.length > 0) {
+      const entries = this.matchEntries;
+      web3.recordMatch(record, entries).catch(() => {});
+    }
   }
 
   /** From the in-game menu. Anyone can change the bots; that applies to everyone, from the lobby. */
@@ -242,9 +314,9 @@ export class GameRoom extends Room<{ state: GameState }> {
     const player = this.state.players.get(id);
     if (!player || typeof msg !== "object" || msg === null) return;
     const name = sanitizeName(msg.name);
-    if (name) {
-      player.name = name;
-      this.meta.get(id)!.ranked = !player.bot;
+    const client = this.clients.getById(id);
+    if (name && name !== player.name && client) {
+      player.name = this.pickName(client, this.meta.get(id)!.profileId, name, player.name);
     }
     const difficulty = msg.difficulty;
     if (difficulty && DIFFICULTIES.includes(difficulty) && difficulty !== this.state.difficulty) {
@@ -254,6 +326,17 @@ export class GameRoom extends Room<{ state: GameState }> {
       this.broadcast(MSG_NOTICE, `${player.name} set the bots to ${difficulty}${now ? "" : " from the next match"}`);
     }
     if (typeof msg.spectate === "boolean" && msg.spectate !== player.spectator) this.setSpectator(id, player, msg.spectate);
+  }
+
+  /**
+   * The name a human ends up with: `wanted` if no other profile holds it (it
+   * becomes their profile's), otherwise `fallback`, with a notice saying why.
+   */
+  private pickName(client: Client, profileId: string, wanted: string, fallback: string): string {
+    if (!wanted) return fallback;
+    if (profileId ? profiles.rename(profileId, wanted) : !profiles.nameTaken(wanted)) return wanted;
+    client.send(MSG_NOTICE, `The name ${wanted} is taken`);
+    return fallback;
   }
 
   /** Not while alive in a match: that would be a free way out of a losing fight. */
@@ -312,7 +395,8 @@ export class GameRoom extends Room<{ state: GameState }> {
     this.meta.set(id, {
       inputs: [], lastQueuedSeq: 0, prevKeys: 0, prevSlot: 0, nextFireTick: 0, reloadDoneTick: 0, healDoneTick: 0,
       zoneDamage: 0, latencyMs: 0, histX: new Float32Array(HISTORY_TICKS), histY: new Float32Array(HISTORY_TICKS),
-      histFrom: this.tick, damageDealt: 0, spawnTick: this.tick, watchId: "", visible: new Set(), ranked: false,
+      histFrom: this.tick, damageDealt: 0, spawnTick: this.tick, watchId: "", visible: new Set(), profileId: "",
+      collected: new Map(), crates: 0,
     });
     player.color = this.pickColor();
     this.state.players.set(id, player);
@@ -320,6 +404,17 @@ export class GameRoom extends Room<{ state: GameState }> {
   }
 
   private removePlayer(id: string) {
+    // Leaving alive mid-match ends their match like an elimination would, so
+    // their profile, the match record and their career all see it.
+    const p = this.state.players.get(id);
+    if (p && p.alive && !p.spectator && this.combat) {
+      p.alive = false;
+      let place = 1;
+      this.state.players.forEach((other) => {
+        if (other.alive) place++;
+      });
+      this.sendStats(id, p, place, "");
+    }
     this.state.players.delete(id);
     this.meta.delete(id);
     this.bots.delete(id);
@@ -351,6 +446,8 @@ export class GameRoom extends Room<{ state: GameState }> {
     meta.spawnTick = this.tick;
     meta.watchId = "";
     meta.histFrom = this.tick + 1;
+    meta.collected.clear();
+    meta.crates = 0;
   }
 
   private placeAtSpawn(player: Player) {
@@ -460,7 +557,7 @@ export class GameRoom extends Room<{ state: GameState }> {
 
       if (!this.combat) return;
       this.finishTimers(player, meta);
-      this.autoPickup(player);
+      this.autoPickup(id, player);
       if (dps > 0 && this.zone.isOutside(player.x, player.y)) {
         meta.zoneDamage += dps * TICK_DT;
         if (meta.zoneDamage >= 1) {
@@ -526,7 +623,7 @@ export class GameRoom extends Room<{ state: GameState }> {
       player.slot = input.slot;
       player.reloading = false;
     }
-    if (pressed & KEY_INTERACT) this.pickupWeapon(player);
+    if (pressed & KEY_INTERACT) this.pickupWeapon(id, player);
     if (pressed & KEY_RELOAD) this.startReload(player, meta);
     if (pressed & KEY_HEAL) this.startHeal(player, meta);
     if (input.fire) this.tryFire(id, player, meta);
@@ -643,7 +740,7 @@ export class GameRoom extends Room<{ state: GameState }> {
       b.traveled += step;
       if (hitT <= 1 || b.traveled >= b.weapon.range) {
         if (hitPlayer) this.damage(hitPlayer, b.weapon.damage, b.owner, b.weapon.name);
-        else if (solid?.crateId && hitT === solid.t) this.damageCrate(solid.crateId, b.weapon.damage);
+        else if (solid?.crateId && hitT === solid.t) this.damageCrate(solid.crateId, b.weapon.damage, b.owner);
         this.bullets.delete(id);
         this.state.bullets.delete(id);
       } else {
@@ -653,7 +750,7 @@ export class GameRoom extends Room<{ state: GameState }> {
     }
   }
 
-  private damageCrate(id: string, amount: number) {
+  private damageCrate(id: string, amount: number, by?: string) {
     const crate = this.state.crates.get(id);
     if (!crate || !this.combat) return;
     if (crate.hp > amount) {
@@ -663,6 +760,8 @@ export class GameRoom extends Room<{ state: GameState }> {
     this.state.crates.delete(id);
     const i = this.map.crates.findIndex((c) => c.id === id);
     if (i >= 0) this.map.crates.splice(i, 1);
+    const meta = by ? this.meta.get(by) : undefined;
+    if (meta) meta.crates++;
     if (Math.random() < 0.6) {
       dropLoot(this.state, this.newId(), randomLootType(), crate.x + CRATE_SIZE / 2, crate.y + CRATE_SIZE / 2);
     }
@@ -730,21 +829,48 @@ export class GameRoom extends Room<{ state: GameState }> {
   private sendStats(id: string, p: Player, place: number, killer: string) {
     const meta = this.meta.get(id);
     if (!meta) return;
-    if (meta.ranked) leaderboard.record(p.name, { place, kills: p.kills, damage: meta.damageDealt });
-    this.clients.getById(id)?.send(MSG_STATS, {
+    const client = this.clients.getById(id);
+    const result: MatchResult = {
       place,
       kills: p.kills,
       damage: meta.damageDealt,
       survivedSeconds: Math.round((this.tick - meta.spawnTick) / TICK_RATE),
+      items: Object.fromEntries(meta.collected),
+      crates: meta.crates,
+    };
+    if (meta.profileId) {
+      for (const a of profiles.record(meta.profileId, result)) {
+        client?.send(MSG_NOTICE, `Achievement unlocked: ${a.title}`);
+      }
+    }
+    if (!p.spectator) {
+      // Collected here rather than at match end so leavers keep their record.
+      this.matchLog.push({
+        name: p.name, bot: p.bot, ...(meta.address ? { address: meta.address } : {}),
+        place, kills: p.kills, damage: Math.round(meta.damageDealt),
+        survivedSeconds: result.survivedSeconds, items: result.items, crates: result.crates,
+      });
+      if (meta.address) {
+        this.matchEntries.push({
+          ...result, address: meta.address, name: p.name, mapId: this.map.id, mapSeed: this.map.seed, matchId: this.matchId,
+        });
+      }
+    }
+    client?.send(MSG_STATS, {
+      place,
+      kills: p.kills,
+      damage: meta.damageDealt,
+      survivedSeconds: result.survivedSeconds,
       killer,
     } satisfies StatsMessage);
   }
 
   // ---- Loot -------------------------------------------------------------
 
-  private autoPickup(player: Player) {
+  private autoPickup(id: string, player: Player) {
+    const meta = this.meta.get(id)!;
     const r2 = PICKUP_RADIUS * PICKUP_RADIUS;
-    this.state.loot.forEach((loot, id) => {
+    this.state.loot.forEach((loot, lootId) => {
       if ((loot.x - player.x) ** 2 + (loot.y - player.y) ** 2 > r2) return;
       if (loot.type === LOOT_MEDKIT && player.medkits < MAX_MEDKITS) {
         player.medkits++;
@@ -760,25 +886,28 @@ export class GameRoom extends Room<{ state: GameState }> {
       } else {
         return;
       }
-      this.state.loot.delete(id);
+      meta.collected.set(loot.type, (meta.collected.get(loot.type) ?? 0) + 1);
+      this.state.loot.delete(lootId);
     });
   }
 
-  private pickupWeapon(player: Player) {
+  private pickupWeapon(id: string, player: Player) {
     let bestId: string | null = null;
     let bestD = PICKUP_RADIUS * PICKUP_RADIUS;
-    this.state.loot.forEach((loot, id) => {
+    this.state.loot.forEach((loot, lootId) => {
       if (!isWeaponLoot(loot.type)) return;
       const d = (loot.x - player.x) ** 2 + (loot.y - player.y) ** 2;
       if (d <= bestD) {
         bestD = d;
-        bestId = id;
+        bestId = lootId;
       }
     });
     if (!bestId) return;
     const loot = this.state.loot.get(bestId)!;
     this.state.loot.delete(bestId);
     player.reloading = false;
+    const meta = this.meta.get(id);
+    if (meta) meta.collected.set(loot.type, (meta.collected.get(loot.type) ?? 0) + 1);
     const dropped = giveWeapon(player, loot.type, loot.amount);
     if (dropped) dropLoot(this.state, this.newId(), dropped.weapon, player.x, player.y, dropped.reserve);
   }

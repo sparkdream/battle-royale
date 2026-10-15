@@ -19,7 +19,7 @@ COPY --from=build /app/shared shared
 COPY --from=build /app/server server
 COPY --from=build /app/client/package.json client/
 COPY --from=build /app/client/dist client/dist
-# The leaderboard; mount a volume here to keep it across containers.
+# The profile database; mount a volume here to keep it across containers.
 RUN mkdir data && chown node:node data
 VOLUME /app/data
 EXPOSE 2567

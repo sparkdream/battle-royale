@@ -11,6 +11,12 @@
     "@colyseus/core": "^0.18.18",
     "@colyseus/schema": "^5.0.36",
     "@colyseus/ws-transport": "^0.18.4",
+    "@cosmjs/amino": "^0.39.0",
+    "@cosmjs/crypto": "^0.39.0",
+    "@cosmjs/encoding": "^0.39.0",
+    "@cosmjs/proto-signing": "^0.39.0",
+    "@cosmjs/stargate": "^0.39.0",
+    "@sparkdreamnft/sparkdreamjs": "^0.0.44",
     "express": "^5.2.1",
     "tsx": "^4.23.15"
   },
