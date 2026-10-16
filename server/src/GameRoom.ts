@@ -25,6 +25,10 @@ import { ZoneController } from "./ZoneController";
 // Inputs applied per player per tick. Lets a client that stalled catch up a
 // little without letting it move faster than everyone else.
 const MAX_INPUTS_PER_TICK = 2;
+// Each tick earns one input credit, banked up to this many; applying an input
+// spends one. A catch-up burst only spends credit a stall left unused, so a
+// client flooding inputs still moves at 1x on average.
+const MAX_INPUT_CREDIT = TICK_RATE;
 // Inputs that arrive in a burst after a network stall are buffered, not dropped:
 // the client has already predicted them, so dropping one makes it snap back.
 const MAX_QUEUED_INPUTS = TICK_RATE;
@@ -54,6 +58,7 @@ const HISTORY_TICKS = Math.ceil(LAG_COMP_MAX_MS / TICK_MS) + 2;
 
 interface PlayerMeta {
   inputs: InputMessage[];
+  inputCredit: number;
   lastQueuedSeq: number;
   /** Keys held in the last applied input, to detect presses. */
   prevKeys: number;
@@ -393,7 +398,7 @@ export class GameRoom extends Room<{ state: GameState }> {
 
   private addPlayer(id: string, player: Player) {
     this.meta.set(id, {
-      inputs: [], lastQueuedSeq: 0, prevKeys: 0, prevSlot: 0, nextFireTick: 0, reloadDoneTick: 0, healDoneTick: 0,
+      inputs: [], inputCredit: 0, lastQueuedSeq: 0, prevKeys: 0, prevSlot: 0, nextFireTick: 0, reloadDoneTick: 0, healDoneTick: 0,
       zoneDamage: 0, latencyMs: 0, histX: new Float32Array(HISTORY_TICKS), histY: new Float32Array(HISTORY_TICKS),
       histFrom: this.tick, damageDealt: 0, spawnTick: this.tick, watchId: "", visible: new Set(), profileId: "",
       collected: new Map(), crates: 0,
@@ -439,6 +444,7 @@ export class GameRoom extends Room<{ state: GameState }> {
     this.placeAtSpawn(p);
     const meta = this.meta.get(id)!;
     meta.inputs.length = 0;
+    meta.inputCredit = 0;
     meta.prevSlot = 0;
     meta.zoneDamage = 0;
     meta.nextFireTick = 0;
@@ -546,7 +552,9 @@ export class GameRoom extends Room<{ state: GameState }> {
       if (bot) {
         this.applyInput(id, player, meta, bot.think(player, this.botWorld));
       } else {
-        for (let n = 0; n < MAX_INPUTS_PER_TICK && meta.inputs.length > 0; n++) {
+        meta.inputCredit = Math.min(meta.inputCredit + 1, MAX_INPUT_CREDIT);
+        for (let n = 0; n < MAX_INPUTS_PER_TICK && meta.inputCredit >= 1 && meta.inputs.length > 0; n++) {
+          meta.inputCredit--;
           this.applyInput(id, player, meta, meta.inputs.shift()!);
         }
       }

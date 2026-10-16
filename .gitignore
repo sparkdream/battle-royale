@@ -11,3 +11,5 @@ CLAUDE.md
 .zcode/
 # Syncthing folder marker (per machine)
 .stfolder/
+# Design notes not meant for the repository
+docs/untracked/

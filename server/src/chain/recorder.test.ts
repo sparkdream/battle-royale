@@ -10,6 +10,7 @@ const DENOM = "usparz.sparkdreamdev";
 /** An in-memory x/artifact: mints land as tokens, classes are creatable. */
 class FakeChain implements ChainClient {
   address = "sprkdrm1relayer";
+  canCreateClasses = true;
   private classes: { classId: string; symbol: string; owner: string }[] = [];
   private tokens: ChainToken[] = [];
   private nextClass = 1;
@@ -117,6 +118,19 @@ describe("Web3Recorder", () => {
     expect(created).toHaveLength(4);
   });
 
+  it("with a session key, refuses to start until the granter has created the classes", async () => {
+    const fake = new FakeChain();
+    fake.canCreateClasses = false;
+    await expect(Web3Recorder.bootstrap(fake, DENOM)).rejects.toThrow(/BRCAREER, BRBADGE, BRMAP, BRMATCH/);
+    expect(fake.broadcasts).toHaveLength(0);
+    // once they exist (created with the account's own key), it finds them
+    fake.canCreateClasses = true;
+    await Web3Recorder.bootstrap(fake, DENOM);
+    fake.canCreateClasses = false;
+    const classes = await Web3Recorder.bootstrap(fake, DENOM);
+    expect(Object.keys(classes).sort()).toEqual(["badge", "career", "map", "match"]);
+  });
+
   it("first match: mints career tokens, badges, and the winner's map token", async () => {
     const { fake, recorder: rec } = await recorder();
     const notices: Web3Notice[] = [];
@@ -200,6 +214,22 @@ describe("Web3Recorder", () => {
     expect(stats.lastMatch).toBe("fedcba9876543210");
     // No repeat badges; the second match's winner is nobody (place 2), so no map mint either: only the match token.
     expect(msgs.filter((m) => m.typeUrl.endsWith("MsgMint"))).toHaveLength(1);
+  });
+
+  it("one wallet playing twice in a match gets one career token holding both results", async () => {
+    const { fake, recorder: rec } = await recorder();
+    await rec.recordMatch(match(), [
+      entry({ place: 1, kills: 3 }),
+      entry({ place: 2, kills: 1 }),
+    ]);
+    const careers = (await fake.tokensByOwner("sprkdrm1ada")).filter((t) => t.classId === "1");
+    expect(careers).toHaveLength(1);
+    expect(careerFromAttributes(careers[0].attributes)).toMatchObject({ matches: 2, kills: 4, wins: 1 });
+
+    fake.broadcasts.length = 0;
+    await rec.recordMatch(match(), [entry({ place: 1 }), entry({ place: 2 })]);
+    const msgs = fake.broadcasts.flat();
+    expect(msgs.filter((m) => m.typeUrl.endsWith("MsgUpdateToken"))).toHaveLength(1);
   });
 
   it("a failed broadcast evicts the cache so the next match resumes from the chain", async () => {

@@ -1,15 +1,25 @@
 /**
  * The game server's connection to a Spark Dream chain, via sparkdreamjs:
- * `getSigningSparkdreamClient` for txs (the relayer key signs everything)
- * and `ClientFactory.createRPCQueryClient` for typed queries.
+ * `getSigningSparkdreamClient` for txs and the LCD client for queries.
+ *
+ * Two ways to sign (config.ts):
+ * - key mode: the relayer's own mnemonic signs every tx and may create classes.
+ * - session mode: a session key, granted by the game management account
+ *   through x/session, signs `MsgExecSession` wrappers; the chain executes
+ *   the inner mints and updates as the granter and takes the fees from the
+ *   grant's spend limit. The key file is re-read before every tx so a
+ *   rotation needs no restart. Classes must already exist: MsgCreateClass is
+ *   not delegable.
  *
  * Exposed as the narrow `ChainClient` interface so tests can fake it; the
  * recorder never touches cosmjs directly.
  */
 
-import type { EncodeObject } from "@cosmjs/proto-signing";
+import { readFileSync } from "node:fs";
+import type { EncodeObject, Registry } from "@cosmjs/proto-signing";
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { fromBase64 } from "@cosmjs/encoding";
+import type { SigningStargateClient } from "@cosmjs/stargate";
 import { getSigningSparkdreamClient, sparkdream } from "@sparkdreamnft/sparkdreamjs";
 import type { AttributePair } from "@br/shared";
 import type { ChainModuleConfig } from "./config";
@@ -30,8 +40,10 @@ export interface OwnedClassInfo {
 
 /** The chain surface the recorder uses. */
 export interface ChainClient {
-  /** The relayer's address (class owner / minter). */
+  /** The relayer's address (class owner / minter): the granter, in session mode. */
   readonly address: string;
+  /** Key mode only: a session grant covers mints and updates, never MsgCreateClass. */
+  readonly canCreateClasses: boolean;
   /** Signs and broadcasts; resolves to the tx hashes in order. Serialized per client. */
   broadcast(msgs: readonly EncodeObject[], memo: string): Promise<string[]>;
   classesByOwner(owner: string): Promise<OwnedClassInfo[]>;
@@ -39,11 +51,61 @@ export interface ChainClient {
   tokensOfClass(classId: string): Promise<ChainToken[]>;
 }
 
-export async function connectChain(cfg: ChainModuleConfig): Promise<ChainClient> {
+export const MSG_EXEC_SESSION = "/sparkdream.session.v1.MsgExecSession";
+
+/** Wrap messages (≤10) for a session key to execute as `granter`. */
+export function sessionExec(registry: Registry, grantee: string, granter: string, msgs: readonly EncodeObject[]): EncodeObject {
+  if (msgs.length === 0 || msgs.length > 10) throw new Error(`a session exec carries 1–10 messages, not ${msgs.length}`);
+  return { typeUrl: MSG_EXEC_SESSION, value: { grantee, granter, msgs: msgs.map((m) => registry.encodeAsAny(m)) } };
+}
+
+/** How txs get signed: the relayer's own key, or a session key read from a file. */
+interface Signer {
+  /** The address whose messages are executed (class owner, minter). */
+  address: string;
+  canCreateClasses: boolean;
+  /** The signing client and the account that signs; rebuilt when the session key file changes. */
+  client(): Promise<{ signing: SigningStargateClient; sender: string }>;
+}
+
+async function keySigner(cfg: ChainModuleConfig): Promise<Signer> {
   const { chain } = cfg;
   const wallet = await DirectSecp256k1HdWallet.fromMnemonic(cfg.mnemonic, { prefix: chain.bech32Prefix });
   const [{ address }] = await wallet.getAccounts();
   const signing = await getSigningSparkdreamClient({ rpcEndpoint: chain.rpcEndpoint, signer: wallet });
+  return { address, canCreateClasses: true, client: async () => ({ signing, sender: address }) };
+}
+
+function sessionSigner(cfg: ChainModuleConfig): Signer {
+  const { chain } = cfg;
+  const { keyFile, granter } = cfg.session!;
+  let current: { mnemonic: string; signing: SigningStargateClient; sender: string } | null = null;
+  return {
+    address: granter,
+    canCreateClasses: false,
+    async client() {
+      let mnemonic: string;
+      try {
+        mnemonic = readFileSync(keyFile, "utf8").trim();
+      } catch {
+        throw new Error(`session key ${keyFile} is not there yet (the launcher delivers it after the grant)`);
+      }
+      if (!current || current.mnemonic !== mnemonic) {
+        const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, { prefix: chain.bech32Prefix });
+        const [{ address }] = await wallet.getAccounts();
+        const signing = await getSigningSparkdreamClient({ rpcEndpoint: chain.rpcEndpoint, signer: wallet });
+        current?.signing.disconnect();
+        current = { mnemonic, signing, sender: address };
+      }
+      return { signing: current.signing, sender: current.sender };
+    },
+  };
+}
+
+export async function connectChain(cfg: ChainModuleConfig): Promise<ChainClient> {
+  const { chain } = cfg;
+  const signer = cfg.session ? sessionSigner(cfg) : await keySigner(cfg);
+  const { address } = signer;
   // The LCD query client (plain REST): the generated RPC query client wants
   // cosmjs's Tendermint34Client, which cosmjs 0.39 no longer ships.
   const query = await sparkdream.ClientFactory.createLCDClient({ restEndpoint: chain.lcdEndpoint });
@@ -93,21 +155,25 @@ export async function connectChain(cfg: ChainModuleConfig): Promise<ChainClient>
 
   const client: ChainClient = {
     address,
+    canCreateClasses: signer.canCreateClasses,
 
     broadcast: (msgs, memo) =>
       enqueue(async () => {
         const hashes: string[] = [];
+        const { signing, sender } = await signer.client();
         // max_batch_size (50 mint entries) bounds one MsgMint; chunk whole
-        // messages so a big match never exceeds the block gas limit either.
+        // messages so a big match never exceeds the block gas limit either
+        // (and a session exec carries at most 10).
         for (let i = 0; i < msgs.length; i += 8) {
-          const chunk = msgs.slice(i, i + 8);
-          const gas = await signing.simulate(address, chunk, memo);
+          const inner = msgs.slice(i, i + 8);
+          const chunk = cfg.session ? [sessionExec(signing.registry, sender, address, inner)] : inner;
+          const gas = await signing.simulate(sender, chunk, memo);
           const limit = Math.ceil(gas * 1.3);
           const fee = {
             amount: [{ denom: gasDenom, amount: String(Math.ceil(limit * gasAmount)) }],
             gas: String(limit),
           };
-          const result = await signing.signAndBroadcast(address, chunk, fee, memo);
+          const result = await signing.signAndBroadcast(sender, chunk, fee, memo);
           if (result.code !== 0) throw new Error(`tx failed (${result.code}): ${result.rawLog}`);
           hashes.push(result.transactionHash);
         }

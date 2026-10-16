@@ -53,11 +53,21 @@ export class Web3Recorder {
     return () => this.sinks.delete(sink);
   }
 
-  /** Find (or create) the classes this deployment mints in. Throws with the chain's reason on failure. */
+  /**
+   * Find (or, with the relayer's own key, create) the classes this deployment
+   * mints in. A session key cannot create classes: the granter does, once
+   * (the launcher's create-classes step, or `MsgCreateClass` by hand).
+   */
   static async bootstrap(client: ChainClient, denom: string): Promise<ClassIds> {
     const owned = await client.classesByOwner(client.address);
     const bySymbol = new Map(owned.map((c) => [c.symbol, c.classId]));
     const missing = CLASS_SPECS.filter((spec) => !bySymbol.has(spec.symbol));
+    if (missing.length > 0 && !client.canCreateClasses) {
+      throw new Error(
+        `${client.address} owns no ${missing.map((m) => m.symbol).join(", ")} class: a session key cannot create classes, ` +
+          "so create them with that account's own key first",
+      );
+    }
     if (missing.length > 0) {
       await client.broadcast(missing.map((spec) => createClassMsg(client.address, spec, denom)), "battle-royale: create classes");
       const now = await client.classesByOwner(client.address);
@@ -79,6 +89,9 @@ export class Web3Recorder {
     if (linked.length === 0) return;
     const touched: string[] = [];
     const msgs: EncodeObject[] = [];
+    // One career message per address: the same wallet can play twice in a
+    // match (two tabs), and a second mint would leave it with two career tokens.
+    const careerMsgs = new Map<string, EncodeObject>();
     const notices: { address: string; notice: Web3Notice }[] = [];
     let winner: MatchEntry | undefined;
 
@@ -90,14 +103,14 @@ export class Web3Recorder {
         const unlocked = newAchievements(merged, entry, before.achievements);
         merged.achievements = [...before.achievements, ...unlocked.map((a) => a.code)];
         record.stats = merged;
-        touched.push(entry.address);
+        if (!touched.includes(entry.address)) touched.push(entry.address);
 
         const meta = tokenMetadata(
           `${merged.name} — Battle Royale Career`,
           "Lifetime record kept by the Spark Dream battle royale.",
           careerToAttributes(merged),
         );
-        msgs.push(record.tokenId !== null
+        careerMsgs.set(entry.address, record.tokenId !== null
           ? {
               typeUrl: MSG_UPDATE_TOKEN,
               value: {
@@ -125,6 +138,8 @@ export class Web3Recorder {
           notice: { career: merged, newAchievements: unlocked.map((a) => a.code), matchId: match.id, txHashes: [] },
         });
       }
+
+      msgs.unshift(...careerMsgs.values());
 
       // The match record: minimal attributes, the full result behind the uri,
       // its hash onchain. Held by the relayer, it is a ledger entry, not a collectible.

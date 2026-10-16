@@ -1,7 +1,8 @@
 /**
  * The process-wide chain integration. Disabled by default (CHAIN_ENABLED=1
- * plus a funded CHAIN_MNEMONIC turns it on); when off, the game behaves
- * exactly as it did before web3 existed.
+ * plus a funded CHAIN_MNEMONIC, or a session key via CHAIN_SESSION_KEY_FILE
+ * + CHAIN_GRANTER, turns it on); when off, the game behaves exactly as it
+ * did before web3 existed.
  */
 
 import type { ChainStatus, MatchEntry, MatchRecord, Web3Notice } from "@br/shared";
@@ -9,12 +10,18 @@ import { connectChain, type ChainClient } from "./client";
 import { loadChainConfig, type ChainModuleConfig } from "./config";
 import { Web3Recorder, type LeaderboardRow, type NoticeSink } from "./recorder";
 
+// A failed boot (node unreachable, classes not created yet) is retried with
+// backoff, so one outage at startup doesn't turn recording off until a restart.
+const BOOT_RETRY_MIN_MS = 30_000;
+const BOOT_RETRY_MAX_MS = 10 * 60_000;
+
 class ChainModule {
   readonly config: ChainModuleConfig = loadChainConfig();
   private recorder: Web3Recorder | null = null;
   private relayer = "";
   private booting: Promise<void> | null = null;
   private failure = "";
+  private retryMs = BOOT_RETRY_MIN_MS;
   /** Rooms register here (possibly before boot); the recorder forwards to them once it exists. */
   private sinks = new Set<NoticeSink>();
 
@@ -40,13 +47,19 @@ class ChainModule {
         return false;
       });
       console.log(
-        `chain: onchain recording on ${this.config.chain.chainId} as ${client.address} ` +
-          `(classes career=${classes.career} badge=${classes.badge} map=${classes.map} match=${classes.match})`,
+        `chain: onchain recording on ${this.config.chain.chainId} as ${client.address}` +
+          (this.config.session ? ` through a session key (${this.config.session.keyFile})` : "") +
+          ` (classes career=${classes.career} badge=${classes.badge} map=${classes.map} match=${classes.match})`,
       );
       if (!this.config.publicUrl) console.warn("chain: PUBLIC_URL is unset; match token uris will be bare paths");
     } catch (err) {
       this.failure = err instanceof Error ? err.message : String(err);
-      console.error(`chain: onchain recording disabled (${this.failure})`);
+      console.error(`chain: onchain recording unavailable (${this.failure}); retrying in ${this.retryMs / 1000} s`);
+      setTimeout(() => {
+        this.booting = null;
+        void this.init();
+      }, this.retryMs).unref();
+      this.retryMs = Math.min(this.retryMs * 2, BOOT_RETRY_MAX_MS);
     }
   }
 

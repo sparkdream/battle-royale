@@ -53,8 +53,9 @@ New-NetFirewallHyperVRule -Name BattleRoyaleDev -DisplayName "Battle royale dev"
 | `MAX_ROOMS` | `10` | Most games running at once. Past it, new games are refused ("server is full") and players join an existing one |
 | `DB_FILE` | `data/game.db` | SQLite file with guest profiles, the leaderboard, achievements and funnel counts. Empty: memory only |
 | `ADMIN_TOKEN` | unset | Turns on `GET /admin/funnel` (funnel counts as JSON), which then needs `Authorization: Bearer <ADMIN_TOKEN>` |
-| `CHAIN_ENABLED` | `0` | `1` turns on onchain recording (needs `CHAIN_MNEMONIC`) |
-| `CHAIN_MNEMONIC` | — | The relayer account's mnemonic. A funded, x/rep-membered key that signs every game tx |
+| `CHAIN_ENABLED` | `0` | `1` turns on onchain recording (needs `CHAIN_MNEMONIC`, or `CHAIN_SESSION_KEY_FILE` + `CHAIN_GRANTER`) |
+| `CHAIN_MNEMONIC` | — | Key mode: the relayer account's mnemonic. A funded, x/rep-membered key that signs every game tx and creates the classes |
+| `CHAIN_SESSION_KEY_FILE` / `CHAIN_GRANTER` | — | Session mode (instead of a mnemonic): a file holding an x/session key's mnemonic, and the game management account that granted it. The game signs `MsgMint` and `MsgUpdateToken` through `MsgExecSession`, re-reading the file before every tx; the granter must have created the classes itself |
 | `CHAIN_RPC` / `CHAIN_LCD` | sparkdream devnet | Endpoints of the chain to write to |
 | `CHAIN_ID` / `CHAIN_DENOM` / `CHAIN_PREFIX` | `sparkdream-dev-1` / `usparz.sparkdreamdev` / `sprkdrm` | Chain identity |
 | `CHAIN_GAS_PRICE` | `0.025usparz.sparkdreamdev` | Gas price for relayer txs |
@@ -99,10 +100,22 @@ module — no game-specific chain code:
   match with a human in it, chain or not. Each token costs the relayer the
   usual 0.1 SPARK deposit plus gas; at thousands of matches a day, switch to
   periodic checkpoint tokens (one per period holding a Merkle root).
+- **Session keys.** On a host you don't control (Akash), don't give the
+  server the account's mnemonic: have the game management account create the
+  four classes itself (`MsgCreateClass` burns SPARK and is not delegable),
+  then grant the server an x/session key scoped to `MsgMint` and
+  `MsgUpdateToken` with a fee budget and an expiry, and point
+  `CHAIN_SESSION_KEY_FILE` / `CHAIN_GRANTER` at it. The chain executes the
+  game's writes as the granter and takes the fees from the grant; a stolen
+  key can only mint into the game's classes until the grant is revoked. The
+  Spark Dream launcher automates this (classes, grant, delivery, renewal).
+  Needs a chain whose x/session allowlist includes the two artifact messages.
 - **UX.** Server-relayer model: the game server signs all chain writes, so
   players get exactly one Keplr popup (the login signature), never per match.
   Everything degrades gracefully: no wallet → guest-profile play; chain
-  down → results still count in the profile and the write is skipped.
+  down → results still count in the profile and the write is skipped. A
+  chain that can't be reached at startup (or classes the granter hasn't
+  created yet) is retried every 30 s, backing off to 10 minutes.
 
 ### Running it against the devnet
 
@@ -151,7 +164,7 @@ docker push sparkdreamnft/battle-royale:v1.0.0
 akash tx deployment create deploy.yaml --from <key> --chain-id akashnet-2 --node <akash-rpc>
 ```
 
-The Spark Dream launcher can deploy it too: in a services fleet (or a chain fleet), **+ add component… → Battle royale**, with the domain. The launcher pins the image tag in its profiles (`BATTLE_IMAGE` in `packages/launch-spec/src/profiles.ts`); bump it there when you release.
+The Spark Dream launcher can deploy it too: in a services fleet (or a chain fleet), **+ add component… → Battle royale**, with the domain. For web3 mode, give it the game management account: a member address whose key stays in your wallet (the launcher pauses for your signature to create the classes and to grant the session key, with CLI commands for a key on another computer), or `topology.components.battle.web3` in the spec editor with `account` (a launcher-generated member) and `target.fleet` (the chain fleet, when the game runs in a services fleet). The launcher renders every `CHAIN_*` variable and `PUBLIC_URL` from the fleet's spec and delivers the session key into the game's data volume; no key is in the deployment. It pins the image tag in its profiles (`BATTLE_IMAGE` in `packages/launch-spec/src/profiles.ts`); bump it there when you release.
 
 To release a new version, push the new image and update the existing deployment with the new tag (Console: Update; CLI: `akash tx deployment update deploy.yaml ...`). An update keeps the lease and the profile database. Always use a new tag: providers cache images, so a reused tag may not update.
 
@@ -214,6 +227,7 @@ Bots carry a `[bot]` tag. Every player gets their own color (unique until there 
 - The old `data/leaderboard.json` isn't imported: results start over in `data/game.db`.
 - Node prints an `ExperimentalWarning` for `node:sqlite` at startup; it's harmless.
 - Map generation is seeded per room (the same seed reproduces a layout; winners get the seed onchain), but there are no hand-made maps yet.
+- Lag compensation rewinds by the latency the client reports (capped at 300 ms), not one the server measures, so a client lying about its ping can hit slightly further into the past.
 - Onchain match writes trust the game server (it signs everything). Forging results would require the relayer key. Match records are served by the same server; the onchain hash proves a record wasn't changed after the match, not that it was true.
 - A match's chain writes go out in chunks of 8 messages (one tx each); if a later chunk fails, the earlier ones stay and nothing is retried. The match token goes first, so a career's `last_match` always exists; what can be missing is a badge or the map token.
 - A profile and a wallet aren't linked to each other: a wallet's onchain career starts from its first linked match, and badges follow that career, not the profile's achievements.
