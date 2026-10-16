@@ -4,7 +4,7 @@
 version: "2.0"
 services:
   game:
-    image: sparkdreamnft/battle-royale:v1.0.1
+    image: sparkdreamnft/battle-royale:v1.0.2
     expose:
       - port: 2567
         as: 80
