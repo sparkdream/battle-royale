@@ -1,7 +1,8 @@
 /**
- * The game's three x/artifact classes, created once per relayer account
- * (idempotently, at boot). Class ids resolve by symbol among the classes the
- * relayer owns, so a second deployment with a different key mints its own.
+ * The game's four x/artifact classes, created once per relayer account
+ * (idempotently, at boot, in key mode; in session mode the granter creates
+ * them itself). Class ids resolve by symbol among the classes the account
+ * owns, so a second deployment with a different account mints its own.
  */
 
 import type { EncodeObject } from "@cosmjs/proto-signing";

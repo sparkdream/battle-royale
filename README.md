@@ -58,8 +58,10 @@ New-NetFirewallHyperVRule -Name BattleRoyaleDev -DisplayName "Battle royale dev"
 | `CHAIN_SESSION_KEY_FILE` / `CHAIN_GRANTER` | — | Session mode (instead of a mnemonic): a file holding an x/session key's mnemonic, and the game management account that granted it. The game signs `MsgMint` and `MsgUpdateToken` through `MsgExecSession`, re-reading the file before every tx; the granter must have created the classes itself |
 | `CHAIN_RPC` / `CHAIN_LCD` | sparkdream devnet | Endpoints of the chain to write to |
 | `CHAIN_ID` / `CHAIN_DENOM` / `CHAIN_PREFIX` | `sparkdream-dev-1` / `usparz.sparkdreamdev` / `sprkdrm` | Chain identity |
+| `CHAIN_NAME` / `CHAIN_DISPLAY_DENOM` | `Spark Dream Devnet` / `SPARK` | How Keplr shows the chain and its coin when the game suggests it |
 | `CHAIN_GAS_PRICE` | `0.025usparz.sparkdreamdev` | Gas price for relayer txs |
-| `CHAIN_EXPLORER` | `https://explorer-devnet.sparkdream.io/sparkdream` | Where tx links point |
+| `CHAIN_EXPLORER` | `https://explorer-devnet.sparkdream.io/sparkdream` | Where tx links point. Empty: no links |
+| `CHAIN_MEMO` | `battle-royale` | Memo on the game's txs, so they're recognisable in explorers |
 | `PUBLIC_URL` | unset | This server's public origin (e.g. `https://battle.sparkdream.io`), the base of match token uris. Unset: uris are bare `/matches/<id>` paths |
 
 For example, `BOT_FILL=20 LOBBY_SECONDS=5 MATCH_SPEED=4 npm run dev`.
