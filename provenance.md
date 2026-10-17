@@ -16,3 +16,16 @@ On-chain provenance for archived Spark Dream files. Each entry documents an arch
 | **SHA-256** | `0x91aaa2cda00a5e1f5098ecea425822047470c65b2e07c39e93a9801ef116b7fc` |
 | **Arweave Wallet** | [4iFET0Ufm0X0805N4u5x7l9XaJHqnh946OgOS6SGx6Q](https://viewblock.io/arweave/address/4iFET0Ufm0X0805N4u5x7l9XaJHqnh946OgOS6SGx6Q) |
 | **Arweave Copy 1** | [fJiYRXWBxvLDbqfWzde-pFr4raDhdJwNadOcWPOKVHQ](https://arweave.net/fJiYRXWBxvLDbqfWzde-pFr4raDhdJwNadOcWPOKVHQ) |
+
+---
+
+## battle-royale2.tgz
+
+| Field | Value |
+|---|---|
+| **Date** | 2026-10-17 01:52:13 UTC |
+| **Git Hash** | 1e3318d69cd1ad1bc07469b2b7dede15fee7a60c |
+| **Ethereum Tx** | [0x8a34218afac6a27509b3bd773e9c87937db4f7bb645e72d50a2df1381fea6e6d](https://etherscan.io/tx/0x8a34218afac6a27509b3bd773e9c87937db4f7bb645e72d50a2df1381fea6e6d) |
+| **SHA-256** | `0xf12af038a4e7fd291a3dcc363ee6592de426476d156ce58685924b99d58a3338` |
+| **Arweave Wallet** | [4iFET0Ufm0X0805N4u5x7l9XaJHqnh946OgOS6SGx6Q](https://viewblock.io/arweave/address/4iFET0Ufm0X0805N4u5x7l9XaJHqnh946OgOS6SGx6Q) |
+| **Arweave Copy 1** | [a57h-df7CgvmZUgnwWYWwlWUtKEReefJQZiotQxdDGA](https://arweave.net/a57h-df7CgvmZUgnwWYWwlWUtKEReefJQZiotQxdDGA) |
